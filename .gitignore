@@ -1,0 +1,4 @@
+.env
+discord.log
+kingshot.db
+__pycache__/
