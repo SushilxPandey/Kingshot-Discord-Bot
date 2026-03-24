@@ -9,6 +9,8 @@ import os
 import re
 from datetime import datetime, timezone
 
+
+
 from database import init_db, save_player, get_player, delete_player
 
 # ─────────────────────────────────────────────
@@ -51,15 +53,18 @@ async def get_player_info(ingame_id):
         async with session.get(url) as response:
             data = await response.json()
             return data
-
+        
 async def get_kingdom_stats(kingdom_id):
     """Fetch kingdom stats from the Kingshot API."""
     url = f"https://kingshot.net/api/kingdom-tracker?kingdomId={kingdom_id}&recent=1&limit=20&sort=openTime-desc"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
             data = await response.json()
-            return data
 
+            # Basic validation to ensure we have the expected data structure    
+            if "data" not in data or "servers" not in data["data"] or len(data["data"]["servers"]) == 0:
+                raise ValueError("Invalid response from Kingshot API: missing 'data.servers'")
+            return data
 
 # ─────────────────────────────────────────────
 #  EVENTS
@@ -183,7 +188,7 @@ async def verify(interaction: discord.Interaction, ingame_name: str, ingame_id: 
             f"Verification failed, {interaction.user.mention}. "
             f"Please make sure your in-game name, kingdom, and player ID are correct."
         )
-
+#_________________THIS IS ADMIN ONLY COMMAND____________________
 @bot.tree.command(name="unverify", description="Unverify a player and revert their role to Commoner")
 async def unverify(interaction: discord.Interaction, member: discord.Member):
     """Unverify a player's account and remove the Verified role. Owner only."""
@@ -217,6 +222,7 @@ async def unverify(interaction: discord.Interaction, member: discord.Member):
         f"{member.mention} has been unverified and reverted to {start_role}.", ephemeral=True
     )
 
+#___________________________________________________
 
 
 @bot.tree.command(name = "mystats", description="Get your in-game stats from the Kingshot API")
@@ -245,19 +251,27 @@ async def mystats(interaction: discord.Interaction):
     await interaction.response.send_message(stats_message)
 
 
-
 @bot.tree.command(name="age", description="Tracks the age of the Kingdhot server")
 async def age(interaction: discord.Interaction, kingdom_id: int):
-    kingdom_data = await get_kingdom_stats(kingdom_id)  # which kingdom?
+    # try/except is used for error handeling in case the API response is not as expected or if the kingdom ID is invalid.
+    try:
+        kingdom_data = await get_kingdom_stats(kingdom_id)  # which kingdom?
     
-    open_time_str = kingdom_data["data"]["servers"][0]["openTime"]
-    open_time = datetime.fromisoformat(open_time_str.replace("Z", "+00:00"))  # fix timezone
+        open_time_str = kingdom_data["data"]["servers"][0]["openTime"]
+        open_time = datetime.fromisoformat(open_time_str.replace("Z", "+00:00"))  # fix timezone
     
-    now = datetime.now(timezone.utc)
-    days = (now - open_time).days
-    
-    await interaction.response.send_message(f"Kingdom {kingdom_id} has been open for {days} days!")
+        now = datetime.now(timezone.utc)
+        days = (now - open_time).days
 
+        await interaction.response.send_message(f"Kingdom {kingdom_id} has been open for {days} days!")
+
+    except ValueError:
+        await interaction.response.send_message(
+        f"Kingdom {kingdom_id} was not found. Please check the kingdom number.", ephemeral=True
+    )
+
+    
+    
 # ─────────────────────────────────────────────
 #  RUN
 # ─────────────────────────────────────────────
