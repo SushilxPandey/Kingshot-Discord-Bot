@@ -206,6 +206,34 @@ async def unverify(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.send_message(
         f"{member.mention} has been unverified and reverted to {start_role}.", ephemeral=True
     )
+
+
+
+@bot.tree.command(name = "mystats", description="Get your in-game stats from the Kingshot API")
+async def mystats(interaction: discord.Interaction):
+    """This commmand allows user to see their in-game stats and show it to other users in the server"""
+    discord_id = str(interaction.user.id)
+    player = get_player(discord_id)
+
+    #if the player is not verified.
+    if not player:
+        await interaction.response.send_message(
+            "You are not verified yet. Please verify your account first using /verify command.", ephemeral=True
+        )
+        return
+    player_info = await get_player_info(player[2])  # player[2] is ingame_id
+    if not player_info or "data" not in player_info:
+        await interaction.response.send_message("Could not retrieve your stats from the Kingshot API. Try again later.", ephemeral=True)
+        return
+    data = player_info["data"]
+    stats_message = (
+        f"**{data['name']}**'s Stats:\n"
+        f"Player ID: {data['playerId']}\n"
+        f"Kingdom: {data['kingdom']}\n"
+        f"Town Center Level: {data['levelRendered']}\n"
+    )
+    await interaction.response.send_message(stats_message)
+
 # ─────────────────────────────────────────────
 #  RUN
 # ─────────────────────────────────────────────
