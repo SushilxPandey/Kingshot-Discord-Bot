@@ -16,6 +16,17 @@ def init_db():
 )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS server_config(
+            guild_id TEXT PRIMARY KEY,
+            start_role TEXT,
+            verified_role TEXT,
+            owner_role TEXT,
+            verify_channel TEXT,
+            general_channel TEXT
+)
+    """)
+
     conn.commit()
     conn.close()
 
