@@ -108,14 +108,13 @@ async def on_member_join(member):
     verify_channel = discord.utils.get(member.guild.text_channels, name=verify_channel_name)
 
     if verify_channel:
-        await verify_channel.send(
+       await verify_channel.send(
             f"Welcome {member.mention}!\n\n"
             f"To gain full access, please verify your Kingshot account using:\n"
-            f"```/verify <ingame_name> <ingame_id> <kingdom> <alliance>```\n"
+            f"```/verify <player_id> <alliance>```\n"
             f"Example:\n"
-            f"```/verify Trojan 123456 466 RTL```"
+            f"```/verify 12345678 ABC```"
         )
-
 
 @bot.event
 async def on_message(message):
@@ -184,7 +183,7 @@ async def hello(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="verify", description="Verify your in-game account with the bot")
-async def verify(interaction: discord.Interaction, ingame_name: str, ingame_id: int, kingdom: int, alliance: str):
+async def verify(interaction: discord.Interaction, ingame_id: int, alliance: str):
 
     config = get_server_config(str(interaction.guild.id))
 
@@ -211,11 +210,24 @@ async def verify(interaction: discord.Interaction, ingame_name: str, ingame_id: 
     verified = discord.utils.get(interaction.guild.roles, name=verified_role)
     start = discord.utils.get(interaction.guild.roles, name=start_role)
 
-    if existing:
+    try:
+        # Fetch info from Kingshot API
+        player_info = await get_player_info(ingame_id)
+        data = player_info["data"]
 
+        ingame_name = data["name"]
+        kingdom = data["kingdom"]
+
+    except Exception:
+        await interaction.response.send_message(
+            "Could not reach the Kingshot API. Try again later.", ephemeral=True
+        )
+        return
+
+    if existing:
+        # Update roles and nickname
         if verified:
             await interaction.user.add_roles(verified)
-
         if start:
             await interaction.user.remove_roles(start)
 
@@ -227,42 +239,23 @@ async def verify(interaction: discord.Interaction, ingame_name: str, ingame_id: 
         )
         return
 
-    try:
+    # Save new player
+    save_player(discord_id, ingame_name, ingame_id, kingdom, alliance)
 
-        player_info = await get_player_info(ingame_id)
+    # Assign roles
+    if verified:
+        await interaction.user.add_roles(verified)
+    if start:
+        await interaction.user.remove_roles(start)
 
-        if (
-            player_info["data"]["name"].lower() == ingame_name.lower()
-            and player_info["data"]["kingdom"] == kingdom
-        ):
+    # Update nickname
+    nick = f"[{kingdom}] {alliance}- {ingame_name}"[:32]
+    await interaction.user.edit(nick=nick)
 
-            save_player(discord_id, ingame_name, ingame_id, kingdom, alliance)
+    await interaction.response.send_message(
+        f"Verified! Welcome [{kingdom}] {alliance} - {ingame_name}, {interaction.user.mention}!"
+    )
 
-            if verified:
-                await interaction.user.add_roles(verified)
-
-            if start:
-                await interaction.user.remove_roles(start)
-
-            nick = f"[{kingdom}] {alliance}- {ingame_name}"[:32]
-            await interaction.user.edit(nick=nick)
-
-            await interaction.response.send_message(
-                f"Your account has been verified, {interaction.user.mention}!"
-            )
-
-        else:
-
-            await interaction.response.send_message(
-                f"Verification failed, {interaction.user.mention}. "
-                f"Please make sure your in-game name, kingdom, and player ID are correct."
-            )
-
-    except Exception:
-
-        await interaction.response.send_message(
-            "Could not reach the Kingshot API. Try again later."
-        )
 
 
 @bot.tree.command(name="unverify", description="Unverify a player and revert their role. Owner only.")
