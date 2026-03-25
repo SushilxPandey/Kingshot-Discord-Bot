@@ -58,3 +58,21 @@ def delete_player(discord_id):
     conn.commit()
     conn.close()
     
+def save_server_config(guild_id, start_role, verified_role, owner_role, verify_channel, general_channel):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT OR REPLACE INTO server_config (guild_id, start_role, verified_role, owner_role, verify_channel, general_channel)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (guild_id, start_role, verified_role, owner_role, verify_channel, general_channel))
+
+    conn.commit()
+    conn.close()
+
+def get_server_config(guild_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM server_config WHERE guild_id = ?", (guild_id,))
+    config = c.fetchone()
+    conn.close()
+    return config
