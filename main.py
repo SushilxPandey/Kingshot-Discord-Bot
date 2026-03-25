@@ -83,8 +83,11 @@ async def on_member_join(member):
 
     role = discord.utils.get(member.guild.roles, name=start_role)
     if role:
-        await member.add_roles(role)
-        print(f"Assigned {start_role} role to {member.name}")
+        try:
+            await member.add_roles(role)
+            print(f"Assigned {start_role} role to {member.name}")
+        except Exception as e:
+            print(f"Error occurred while assigning role: {e}")
     else:
         print(f"Role '{start_role}' not found. Please contact the owner or try again.")
 
@@ -165,29 +168,29 @@ async def verify(interaction: discord.Interaction, ingame_name: str, ingame_id: 
     # Call the Kingshot API
     try:
         player_info = await get_player_info(ingame_id)
+        if player_info["data"]["name"] == ingame_name and player_info["data"]["kingdom"] == kingdom:
+            save_player(discord_id, ingame_name, ingame_id, kingdom, alliance)
+
+            role = discord.utils.get(interaction.guild.roles, name=verified_role)
+            if role:
+                await interaction.user.add_roles(role)
+                await interaction.user.remove_roles(discord.utils.get(interaction.guild.roles, name=start_role))
+                await interaction.user.edit(nick=f"[{kingdom}] {alliance}- {ingame_name}")
+                print(f"Assigned '{verified_role}' role to {interaction.user.name}")
+
+            await interaction.response.send_message(
+            f"Your account has been verified, {interaction.user.mention}!"
+            )
+        else:
+            await interaction.response.send_message(
+                f"Verification failed, {interaction.user.mention}. "
+                f"Please make sure your in-game name, kingdom, and player ID are correct."
+                )
     except Exception:
         await interaction.response.send_message("Could not reach the Kingshot API. Try again later.")
         return
 
     # Check if the provided details match the API response
-    if player_info["data"]["name"] == ingame_name and player_info["data"]["kingdom"] == kingdom:
-        save_player(discord_id, ingame_name, ingame_id, kingdom, alliance)
-
-        role = discord.utils.get(interaction.guild.roles, name=verified_role)
-        if role:
-            await interaction.user.add_roles(role)
-            await interaction.user.remove_roles(discord.utils.get(interaction.guild.roles, name=start_role))
-            await interaction.user.edit(nick=f"[{kingdom}] {alliance}- {ingame_name}")
-            print(f"Assigned '{verified_role}' role to {interaction.user.name}")
-
-        await interaction.response.send_message(
-            f"Your account has been verified, {interaction.user.mention}!"
-        )
-    else:
-        await interaction.response.send_message(
-            f"Verification failed, {interaction.user.mention}. "
-            f"Please make sure your in-game name, kingdom, and player ID are correct."
-        )
 #_________________THIS IS ADMIN ONLY COMMAND____________________
 @bot.tree.command(name="unverify", description="Unverify a player and revert their role to Commoner")
 async def unverify(interaction: discord.Interaction, member: discord.Member):
@@ -242,13 +245,15 @@ async def mystats(interaction: discord.Interaction):
         await interaction.response.send_message("Could not retrieve your stats from the Kingshot API. Try again later.", ephemeral=True)
         return
     data = player_info["data"]
-    stats_message = (
-        f"**{data['name']}**'s Stats:\n"
-        f"Player ID: {data['playerId']}\n"
-        f"Kingdom: {data['kingdom']}\n"
-        f"Town Center Level: {data['levelRendered']}\n"
-    )
-    await interaction.response.send_message(stats_message)
+
+    embed = discord.Embed(title=f"{data.get('name', 'Unknown')}'s Stats", color=discord.Color.blue())
+    embed.add_field(name="Player ID", value=data.get("playerId", "Unknown"), inline=False)
+    embed.add_field(name="Kingdom", value=data.get("kingdom", "Unknown"), inline=True)
+    embed.add_field(name="Alliance", value=player[4], inline=True)
+    embed.add_field(name="Town Center Level", value=data.get("levelRendered", "Unknown"), inline=False)
+    embed.set_thumbnail(url=data.get("profilePhoto", ""))
+
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="age", description="Tracks the age of the Kingdhot server")
@@ -263,7 +268,9 @@ async def age(interaction: discord.Interaction, kingdom_id: int):
         now = datetime.now(timezone.utc)
         days = (now - open_time).days
 
-        await interaction.response.send_message(f"Kingdom {kingdom_id} has been open for {days} days!")
+        embed = discord.Embed(title=f"Kingdom {kingdom_id} Age", description=f"Kingdom {kingdom_id} has been open for {days} days!", color=discord.Color.green())
+        embed.add_field(name="Open Date", value=open_time.strftime("%Y-%m-%d"), inline=True)
+        await interaction.response.send_message(embed=embed)
 
     except ValueError:
         await interaction.response.send_message(
