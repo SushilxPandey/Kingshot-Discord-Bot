@@ -7,6 +7,7 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
+import asyncio
 
 from database import init_db, save_player, get_player, delete_player, save_server_config, get_server_config
 
@@ -43,7 +44,12 @@ with open("badwords.txt", "r") as f:
 # ─────────────────────────────────────────────
 async def get_player_info(ingame_id):
     """Fetch player information from the Kingshot API."""
+    
+    if not hasattr(bot, "session") or bot.session.closed:
+        bot.session = aiohttp.ClientSession()
+
     url = f"https://kingshot.net/api/player-info?playerId={ingame_id}"
+
 
     async with bot.session.get(url) as response:
         if response.status != 200:
@@ -53,6 +59,10 @@ async def get_player_info(ingame_id):
 
 async def get_kingdom_stats(kingdom_id):
     """Fetch kingdom stats from the Kingshot API."""
+
+    if not hasattr(bot, "session") or bot.session.closed:
+        bot.session = aiohttp.ClientSession()
+
     url = f"https://kingshot.net/api/kingdom-tracker?kingdomId={kingdom_id}&recent=1&limit=20&sort=openTime-desc"
 
     async with bot.session.get(url) as response:
@@ -377,6 +387,53 @@ async def age(interaction: discord.Interaction, kingdom_id: int):
 @bot.event
 async def on_close():
     await bot.session.close()
+
+
+
+#______________________________________________
+#  AUTOSYNC
+#______________________________________________
+async def auto_sync():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            for guild in bot.guilds:
+                config = get_server_config(str(guild.id))
+                if not config:
+                    continue
+
+                verified_role_name = config[2]
+                verified_role = discord.utils.get(guild.roles, name=verified_role_name)
+                if not verified_role:
+                    continue
+
+                for member in verified_role.members:
+                    discord_id = str(member.id)
+                    player = get_player(discord_id)
+                    if not player:
+                        continue
+
+                    ingame_id = player[2]
+                    alliance = player[4]
+
+                    # Fetch latest info
+                    player_info = await get_player_info(ingame_id)
+                    data = player_info["data"]
+                    ingame_name = data["name"]
+                    kingdom = data["kingdom"]
+
+                    # Update nickname if changed
+                    nick = f"[{kingdom}] {alliance}- {ingame_name}"[:32]
+                    if member.nick != nick:
+                        await member.edit(nick=nick)
+        except Exception as e:
+            logging.error(f"Auto-sync error: {e}")
+
+        # Wait 3 hours before next sync
+        await asyncio.sleep(3 * 60 * 60)
+
+# Start background task
+bot.loop.create_task(auto_sync())
 
 
 # ─────────────────────────────────────────────
