@@ -200,9 +200,11 @@ async def setup(
 
 @bot.tree.command(name="verify", description="Verify your in-game account")
 async def verify(interaction: discord.Interaction, ingame_id: int, alliance: str):
+    await interaction.response.defer(ephemeral=True)  # <-- tells Discord to wait
     config = get_server_config(str(interaction.guild.id))
+    
     if not config:
-        await interaction.response.send_message("Server not configured. Ask an admin to run /setup.", ephemeral=True)
+        await interaction.followup.send("Server not configured. Ask an admin to run /setup.", ephemeral=True)
         return
 
     verify_channel_name = config[4]
@@ -211,7 +213,7 @@ async def verify(interaction: discord.Interaction, ingame_id: int, alliance: str
     allowed_kingdoms = config[6].split(",") if len(config) > 6 else []
 
     if interaction.channel.name != verify_channel_name:
-        await interaction.response.send_message(f"Use this command in #{verify_channel_name} only.", ephemeral=True)
+        await interaction.followup.send(f"Use this command in #{verify_channel_name} only.", ephemeral=True)
         return
 
     discord_id = str(interaction.user.id)
@@ -221,16 +223,16 @@ async def verify(interaction: discord.Interaction, ingame_id: int, alliance: str
     verified = discord.utils.get(interaction.guild.roles, name=verified_role)
 
     try:
-        player_info = await get_player_info(bot, ingame_id)
+        player_info = await get_player_info(bot, ingame_id)  # Might take time
         data = player_info["data"]
         ingame_name = data["name"]
         kingdom = data["kingdom"]
     except Exception:
-        await interaction.response.send_message("Could not reach Kingshot API. Try later.", ephemeral=True)
+        await interaction.followup.send("Could not reach Kingshot API. Try later.", ephemeral=True)
         return
 
     if allowed_kingdoms and str(kingdom) not in allowed_kingdoms:
-        await interaction.response.send_message(f"Your kingdom {kingdom} is not allowed to verify.", ephemeral=True)
+        await interaction.followup.send(f"Your kingdom {kingdom} is not allowed to verify.", ephemeral=True)
         return
 
     # Save/update player
@@ -239,17 +241,17 @@ async def verify(interaction: discord.Interaction, ingame_id: int, alliance: str
         if start: await interaction.user.remove_roles(start)
         nick = f"[{kingdom}] {alliance}- {ingame_name}"[:32]
         await interaction.user.edit(nick=nick)
-        await interaction.response.send_message("You are already verified. Contact admin to update info.", ephemeral=True)
+        await interaction.followup.send("You are already verified. Contact admin to update info.", ephemeral=True)
         return
 
     save_player(discord_id, ingame_name, ingame_id, kingdom, alliance)
-
     if verified: await interaction.user.add_roles(verified)
     if start: await interaction.user.remove_roles(start)
     nick = f"[{kingdom}] {alliance}- {ingame_name}"[:32]
     await interaction.user.edit(nick=nick)
-    await interaction.response.send_message(f"Verified! Welcome [{kingdom}] {alliance}-{ingame_name}", ephemeral=False)
+    await interaction.followup.send(f"Verified! Welcome [{kingdom}] {alliance}-{ingame_name}", ephemeral=False)
 
+    
 @bot.tree.command(name="unverify", description="Unverify a player. Owner only.")
 @app_commands.default_permissions(administrator=True)
 async def unverify(interaction: discord.Interaction, member: discord.Member):
