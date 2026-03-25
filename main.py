@@ -91,6 +91,8 @@ async def on_member_join(member):
         return
 
     start_role = config[1]
+    verify_channel_name = config[4]
+
 
     role = discord.utils.get(member.guild.roles, name=start_role)
 
@@ -103,7 +105,7 @@ async def on_member_join(member):
     else:
         logging.warning(f"Role '{start_role}' not found.")
 
-    verify_channel = discord.utils.get(member.guild.text_channels, name="verify")
+    verify_channel = discord.utils.get(member.guild.text_channels, name=verify_channel_name)
 
     if verify_channel:
         await verify_channel.send(
