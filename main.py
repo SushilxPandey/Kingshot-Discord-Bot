@@ -1,7 +1,6 @@
-from email.mime import message
-
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import logging
@@ -9,9 +8,7 @@ import os
 import re
 from datetime import datetime, timezone
 
-
-
-from database import init_db, save_player, get_player, delete_player
+from database import init_db, save_player, get_player, delete_player, save_server_config, get_server_config
 
 # ─────────────────────────────────────────────
 #  ENVIRONMENT & LOGGING
@@ -29,13 +26,11 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix='/', intents=intents)
+async def close_session():
+    if hasattr(bot, "session") and not bot.session.closed:
+        await bot.session.close()
 
-# ─────────────────────────────────────────────
-#  CONFIGURATION
-# ─────────────────────────────────────────────
-start_role = "Commoner"      # Role assigned to new members on join
-verified_role = "Settler"      # Role assigned after successful verification
-owner_role = "Owner"       # Role that can manage the bot ( reserved for admin commands)
+bot.close_session = close_session
 
 # ─────────────────────────────────────────────
 #  BAD WORDS
@@ -49,22 +44,28 @@ with open("badwords.txt", "r") as f:
 async def get_player_info(ingame_id):
     """Fetch player information from the Kingshot API."""
     url = f"https://kingshot.net/api/player-info?playerId={ingame_id}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            data = await response.json()
-            return data
-        
+
+    async with bot.session.get(url) as response:
+        if response.status != 200:
+            raise ValueError("Kingshot API error")
+        return await response.json()
+
+
 async def get_kingdom_stats(kingdom_id):
     """Fetch kingdom stats from the Kingshot API."""
     url = f"https://kingshot.net/api/kingdom-tracker?kingdomId={kingdom_id}&recent=1&limit=20&sort=openTime-desc"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            data = await response.json()
 
-            # Basic validation to ensure we have the expected data structure    
-            if "data" not in data or "servers" not in data["data"] or len(data["data"]["servers"]) == 0:
-                raise ValueError("Invalid response from Kingshot API: missing 'data.servers'")
-            return data
+    async with bot.session.get(url) as response:
+        if response.status != 200:
+            raise ValueError("Kingshot API error")
+
+        data = await response.json()
+
+        if "data" not in data or "servers" not in data["data"] or len(data["data"]["servers"]) == 0:
+            raise ValueError("Invalid response from Kingshot API")
+
+        return data
+
 
 # ─────────────────────────────────────────────
 #  EVENTS
@@ -72,27 +73,38 @@ async def get_kingdom_stats(kingdom_id):
 @bot.event
 async def on_ready():
     init_db()
+
+    bot.session = aiohttp.ClientSession()
+
     await bot.tree.sync()
-    print(f"We are ready to go!, {bot.user.name}")
+    logging.info(f"We are ready to go!, {bot.user.name}")
 
 
 @bot.event
 async def on_member_join(member):
-  
     """Welcome new members and assign the default role."""
 
+    config = get_server_config(str(member.guild.id))
+
+    if not config:
+        logging.warning(f"Server configuration not found for guild {member.guild.id}. Please run /setup.")
+        return
+
+    start_role = config[1]
+
     role = discord.utils.get(member.guild.roles, name=start_role)
+
     if role:
         try:
             await member.add_roles(role)
-            print(f"Assigned {start_role} role to {member.name}")
+            logging.info(f"Assigned {start_role} role to {member.name}")
         except Exception as e:
-            print(f"Error occurred while assigning role: {e}")
+            logging.error(f"Error assigning role: {e}")
     else:
-        print(f"Role '{start_role}' not found. Please contact the owner or try again.")
+        logging.warning(f"Role '{start_role}' not found.")
 
-    #makes sure the verify channel exists and sends a welcome message with instructions on how to verify their account.
     verify_channel = discord.utils.get(member.guild.text_channels, name="verify")
+
     if verify_channel:
         await verify_channel.send(
             f"Welcome {member.mention}!\n\n"
@@ -106,151 +118,227 @@ async def on_member_join(member):
 @bot.event
 async def on_message(message):
     """Censor bad words and process commands."""
+
     if message.author == bot.user:
         return
 
-    if any(word in message.content.lower() for word in bad_words):
-        cleaned = message.content
-        for word in bad_words:
-            cleaned = re.sub(word, lambda match: "*" * len(match.group()), cleaned, flags=re.IGNORECASE)        
+    cleaned = message.content
+
+    for word in bad_words:
+        cleaned = re.sub(
+            re.escape(word),
+            lambda match: "*" * len(match.group()),
+            cleaned,
+            flags=re.IGNORECASE
+        )
+
+    if cleaned != message.content:
         await message.delete()
         await message.channel.send(f"{message.author.display_name}: {cleaned}")
         return
 
     await bot.process_commands(message)
 
+
 # ─────────────────────────────────────────────
 #  COMMANDS
 # ─────────────────────────────────────────────
 
-#This command is to just greet whenever a user wants to say hello.
-@bot.tree.command(name = "hello", description="Greet the bot and receive a friendly message back!")
+@bot.tree.command(name="setup", description="Initial setup for the bot. Owner only.")
+@app_commands.default_permissions(administrator=True)
+async def setup(interaction: discord.Interaction, start_role_name: str, verified_role_name: str, owner_role_name: str, verify_channel_name: str, general_channel_name: str):
+    """Initial setup for the bot."""
+
+    save_server_config(
+        str(interaction.guild.id),
+        start_role_name,
+        verified_role_name,
+        owner_role_name,
+        verify_channel_name,
+        general_channel_name
+    )
+
+    await interaction.response.send_message("Server configuration saved successfully!", ephemeral=True)
+
+
+@bot.tree.command(name="hello", description="Greet the bot and receive a friendly message back!")
 async def hello(interaction: discord.Interaction):
-    if interaction.channel.name != "general":
+
+    config = get_server_config(str(interaction.guild.id))
+
+    if not config:
+        await interaction.response.send_message("Server not configured yet.", ephemeral=True)
+        return
+
+    general_channel = config[5]
+
+    if interaction.channel.name != general_channel:
         await interaction.response.send_message(
-            "Please use this command in the #general channel only.", ephemeral=True
+            f"Please use this command in the #{general_channel} channel only.", ephemeral=True
         )
         return
-    
+
     await interaction.response.send_message(f"Hello, {interaction.user.mention}! I hope you are having a great day.")
 
-    
-
-
-#This command is to verify a player's Kingshot account and assign the Verified role.
 
 @bot.tree.command(name="verify", description="Verify your in-game account with the bot")
 async def verify(interaction: discord.Interaction, ingame_name: str, ingame_id: int, kingdom: int, alliance: str):
-    """Verify a player's Kingshot account and assign the Verified role."""
 
-    if interaction.channel.name != "verify":
+    config = get_server_config(str(interaction.guild.id))
+
+    if not config:
         await interaction.response.send_message(
-            "Please use this command in the #verify channel only.", ephemeral=True
+            "Server configuration not found. Please ask an admin to run /setup.", ephemeral=True
+        )
+        return
+
+    verify_channel_name = config[4]
+    start_role = config[1]
+    verified_role = config[2]
+
+    if interaction.channel.name != verify_channel_name:
+        await interaction.response.send_message(
+            f"Please use this command in the #{verify_channel_name} channel only.", ephemeral=True
         )
         return
 
     discord_id = str(interaction.user.id)
 
-    # Check if already verified
     existing = get_player(discord_id)
-    if existing:
-        await interaction.user.add_roles(discord.utils.get(interaction.guild.roles, name=verified_role))
-        await interaction.user.remove_roles(discord.utils.get(interaction.guild.roles, name=start_role))
-        await interaction.user.edit(nick=f"[{kingdom}] {alliance}- {ingame_name}")
 
-        await interaction.user.send(
-            f"You have already verified your account, {interaction.user.mention}. "
-            f"If you want to update your information, please contact an admin.",
-            )
-        await interaction.response.send_message("Done!", ephemeral=True)
+    verified = discord.utils.get(interaction.guild.roles, name=verified_role)
+    start = discord.utils.get(interaction.guild.roles, name=start_role)
+
+    if existing:
+
+        if verified:
+            await interaction.user.add_roles(verified)
+
+        if start:
+            await interaction.user.remove_roles(start)
+
+        nick = f"[{kingdom}] {alliance}- {ingame_name}"[:32]
+        await interaction.user.edit(nick=nick)
+
+        await interaction.response.send_message(
+            "You are already verified! Contact an admin to update your info.", ephemeral=True
+        )
         return
 
-    # Call the Kingshot API
     try:
+
         player_info = await get_player_info(ingame_id)
-        if player_info["data"]["name"] == ingame_name and player_info["data"]["kingdom"] == kingdom:
+
+        if (
+            player_info["data"]["name"].lower() == ingame_name.lower()
+            and player_info["data"]["kingdom"] == kingdom
+        ):
+
             save_player(discord_id, ingame_name, ingame_id, kingdom, alliance)
 
-            role = discord.utils.get(interaction.guild.roles, name=verified_role)
-            if role:
-                await interaction.user.add_roles(role)
-                await interaction.user.remove_roles(discord.utils.get(interaction.guild.roles, name=start_role))
-                await interaction.user.edit(nick=f"[{kingdom}] {alliance}- {ingame_name}")
-                print(f"Assigned '{verified_role}' role to {interaction.user.name}")
+            if verified:
+                await interaction.user.add_roles(verified)
+
+            if start:
+                await interaction.user.remove_roles(start)
+
+            nick = f"[{kingdom}] {alliance}- {ingame_name}"[:32]
+            await interaction.user.edit(nick=nick)
 
             await interaction.response.send_message(
-            f"Your account has been verified, {interaction.user.mention}!"
+                f"Your account has been verified, {interaction.user.mention}!"
             )
+
         else:
+
             await interaction.response.send_message(
                 f"Verification failed, {interaction.user.mention}. "
                 f"Please make sure your in-game name, kingdom, and player ID are correct."
-                )
+            )
+
     except Exception:
-        await interaction.response.send_message("Could not reach the Kingshot API. Try again later.")
-        return
 
-    # Check if the provided details match the API response
-#_________________THIS IS ADMIN ONLY COMMAND____________________
-@bot.tree.command(name="unverify", description="Unverify a player and revert their role to Commoner")
+        await interaction.response.send_message(
+            "Could not reach the Kingshot API. Try again later."
+        )
+
+
+@bot.tree.command(name="unverify", description="Unverify a player and revert their role. Owner only.")
+@app_commands.default_permissions(administrator=True)
 async def unverify(interaction: discord.Interaction, member: discord.Member):
-    """Unverify a player's account and remove the Verified role. Owner only."""
 
-    # Check if the user has the Owner role
-    owner_server_role = discord.utils.get(interaction.guild.roles, name="Owner")
-    if owner_server_role not in interaction.user.roles:
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+    config = get_server_config(str(interaction.guild.id))
+
+    if not config:
+        await interaction.response.send_message(
+            "Server configuration not found.", ephemeral=True
+        )
         return
 
-    # Check if the target member is actually verified
+    verified_role = config[2]
+    start_role = config[1]
+
     discord_id = str(member.id)
+
     existing = get_player(discord_id)
+
     if not existing:
-        await interaction.response.send_message(f"{member.mention} is not verified.", ephemeral=True)
+        await interaction.response.send_message(
+            f"{member.mention} is not verified.", ephemeral=True
+        )
         return
 
-    # Remove from database
     delete_player(discord_id)
 
-    # Swap roles
     settler = discord.utils.get(interaction.guild.roles, name=verified_role)
     commoner = discord.utils.get(interaction.guild.roles, name=start_role)
 
     if settler and settler in member.roles:
         await member.remove_roles(settler)
+
     if commoner:
         await member.add_roles(commoner)
 
     await interaction.response.send_message(
-        f"{member.mention} has been unverified and reverted to {start_role}.", ephemeral=True
+        f"{member.mention} has been unverified and reverted to {start_role}.",
+        ephemeral=True
     )
 
-#___________________________________________________
 
-
-@bot.tree.command(name = "mystats", description="Get your in-game stats from the Kingshot API")
+@bot.tree.command(name="mystats", description="Get your in-game stats from the Kingshot API")
 async def mystats(interaction: discord.Interaction):
-    """This commmand allows user to see their in-game stats and show it to other users in the server"""
+
     discord_id = str(interaction.user.id)
     player = get_player(discord_id)
 
-    #if the player is not verified.
     if not player:
         await interaction.response.send_message(
-            "You are not verified yet. Please verify your account first using /verify command.", ephemeral=True
+            "You are not verified yet. Please verify your account first using /verify.",
+            ephemeral=True
         )
         return
-    player_info = await get_player_info(player[2])  # player[2] is ingame_id
+
+    player_info = await get_player_info(player[2])
+
     if not player_info or "data" not in player_info:
-        await interaction.response.send_message("Could not retrieve your stats from the Kingshot API. Try again later.", ephemeral=True)
+        await interaction.response.send_message(
+            "Could not retrieve your stats from the Kingshot API.",
+            ephemeral=True
+        )
         return
+
     data = player_info["data"]
 
-    embed = discord.Embed(title=f"{data.get('name', 'Unknown')}'s Stats", color=discord.Color.blue())
+    embed = discord.Embed(
+        title=f"{data.get('name', 'Unknown')}'s Stats",
+        color=discord.Color.blue()
+    )
+
     embed.add_field(name="Player ID", value=data.get("playerId", "Unknown"), inline=False)
     embed.add_field(name="Kingdom", value=data.get("kingdom", "Unknown"), inline=True)
     embed.add_field(name="Alliance", value=player[4], inline=True)
     embed.add_field(name="Town Center Level", value=data.get("levelRendered", "Unknown"), inline=False)
+
     embed.set_thumbnail(url=data.get("profilePhoto", ""))
 
     await interaction.response.send_message(embed=embed)
@@ -258,28 +346,49 @@ async def mystats(interaction: discord.Interaction):
 
 @bot.tree.command(name="age", description="Tracks the age of the Kingdhot server")
 async def age(interaction: discord.Interaction, kingdom_id: int):
-    # try/except is used for error handeling in case the API response is not as expected or if the kingdom ID is invalid.
+
     try:
-        kingdom_data = await get_kingdom_stats(kingdom_id)  # which kingdom?
-    
+
+        kingdom_data = await get_kingdom_stats(kingdom_id)
+
         open_time_str = kingdom_data["data"]["servers"][0]["openTime"]
-        open_time = datetime.fromisoformat(open_time_str.replace("Z", "+00:00"))  # fix timezone
-    
+        open_time = datetime.fromisoformat(open_time_str.replace("Z", "+00:00"))
+
         now = datetime.now(timezone.utc)
+
         days = (now - open_time).days
 
-        embed = discord.Embed(title=f"Kingdom {kingdom_id} Age", description=f"Kingdom {kingdom_id} has been open for {days} days!", color=discord.Color.green())
+        embed = discord.Embed(
+            title=f"Kingdom {kingdom_id} Age",
+            description=f"Kingdom {kingdom_id} has been open for {days} days!",
+            color=discord.Color.green()
+        )
+
         embed.add_field(name="Open Date", value=open_time.strftime("%Y-%m-%d"), inline=True)
+
         await interaction.response.send_message(embed=embed)
 
     except ValueError:
-        await interaction.response.send_message(
-        f"Kingdom {kingdom_id} was not found. Please check the kingdom number.", ephemeral=True
-    )
 
-    
-    
+        await interaction.response.send_message(
+            f"Kingdom {kingdom_id} was not found.",
+            ephemeral=True
+        )
+
+
+# ─────────────────────────────────────────────
+#  CLEANUP
+# ─────────────────────────────────────────────
+@bot.event
+async def on_close():
+    await bot.session.close()
+
+
 # ─────────────────────────────────────────────
 #  RUN
 # ─────────────────────────────────────────────
-bot.run(token, log_handler=handler, log_level=logging.DEBUG)
+try:
+    bot.run(token, log_handler=handler, log_level=logging.DEBUG)
+finally:
+    import asyncio
+    asyncio.run(bot.close_session())
