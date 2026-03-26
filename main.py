@@ -113,7 +113,7 @@ async def on_message(message):
 @bot.tree.command(name="setup", description="Initial setup for the bot. Owner only.")
 @app_commands.default_permissions(administrator=True)
 async def setup(interaction: discord.Interaction, start_role_name: str, verified_role_name: str,
-                owner_role_name: str, verify_channel_name: str, general_channel_name: str, allowed_kingdom: int):
+                owner_role_name: str, verify_channel_name: str, general_channel_name: str, allowed_kingdom: int, allowed_level: int):
     save_server_config(
         str(interaction.guild.id),
         start_role_name,
@@ -121,7 +121,8 @@ async def setup(interaction: discord.Interaction, start_role_name: str, verified
         owner_role_name,
         verify_channel_name,
         general_channel_name,
-        allowed_kingdom
+        allowed_kingdom,
+        allowed_level
     )
     await interaction.response.send_message("Server configuration saved successfully!", ephemeral=True)
 
@@ -147,6 +148,7 @@ async def verify(interaction: discord.Interaction, ingame_id: int, kingdom: int,
     allowed_kingdom = config[6]
     start_role = config[1]
     verified_role = config[2]
+    allowed_level = config[7]
 
     if interaction.channel.name != verify_channel_name:
         await interaction.response.send_message(f"Use #{verify_channel_name} channel only.", ephemeral=True)
@@ -155,6 +157,7 @@ async def verify(interaction: discord.Interaction, ingame_id: int, kingdom: int,
     if kingdom != allowed_kingdom:
         await interaction.response.send_message(f"Only kingdom {allowed_kingdom} is allowed!", ephemeral=True)
         return
+    
 
     discord_id = str(interaction.user.id)
     existing = get_player(discord_id)
@@ -170,6 +173,10 @@ async def verify(interaction: discord.Interaction, ingame_id: int, kingdom: int,
     player_data = player_info.get("data", {})
     if not player_data or player_data.get("kingdom") != kingdom:
         await interaction.response.send_message("Verification failed. Check ID, kingdom, and alliance.", ephemeral=True)
+        return
+    
+    if player_data.get("level", 0) < allowed_level:
+        await interaction.response.send_message(f"You must be at least Town Center {allowed_level} to verify.", ephemeral=True)
         return
 
     ingame_name = player_data.get("name")

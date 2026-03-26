@@ -24,7 +24,8 @@ def init_db():
             owner_role TEXT,
             verify_channel TEXT,
             general_channel TEXT,
-            allowed_kingdoms INTEGER
+            allowed_kingdoms INTEGER,
+            allowed_level INTEGER
 )
     """)
 
@@ -59,13 +60,13 @@ def delete_player(discord_id):
     conn.commit()
     conn.close()
     
-def save_server_config(guild_id, start_role, verified_role, owner_role, verify_channel, general_channel, allowed_kingdoms):
+def save_server_config(guild_id, start_role, verified_role, owner_role, verify_channel, general_channel, allowed_kingdoms, allowed_level):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        INSERT OR REPLACE INTO server_config (guild_id, start_role, verified_role, owner_role, verify_channel, general_channel, allowed_kingdoms)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (guild_id, start_role, verified_role, owner_role, verify_channel, general_channel, allowed_kingdoms))
+        INSERT OR REPLACE INTO server_config (guild_id, start_role, verified_role, owner_role, verify_channel, general_channel, allowed_kingdoms, allowed_level)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (guild_id, start_role, verified_role, owner_role, verify_channel, general_channel, allowed_kingdoms, allowed_level))
 
     conn.commit()
     conn.close()
