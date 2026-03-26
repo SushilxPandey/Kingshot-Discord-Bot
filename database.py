@@ -1,6 +1,7 @@
 import sqlite3
+import os
 
-DB_PATH = "kingshot.db"
+DB_PATH = os.getenv("DATABASE_URL", "kingshot.db")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)  # creates the file if it doesn't exist
