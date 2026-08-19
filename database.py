@@ -1,667 +1,481 @@
 """
-Per-guild SQLite storage for the Kingshot bot.
+Postgres storage for the Kingshot bot (asyncpg).
 
-Each Discord server gets its OWN database file at ``data/<guild_id>.db`` so a
-server's roster is fully isolated from every other server's (requirement 7).
+A single database holds every server's data, keyed by ``guild_id`` on each table
+(replacing the old one-SQLite-file-per-guild model). The public async API is
+unchanged, so the cogs did not need edits — only the backend swapped.
 
-Every public function is async and offloads the blocking ``sqlite3`` work to a
-worker thread via ``asyncio.to_thread`` so the Discord event loop never stalls,
-even while the background name-tracker is running across many guilds.
+Set ``DATABASE_URL`` in the environment, e.g.
+    postgresql://user:pass@host/dbname?sslmode=require
 """
 
-import asyncio
 import os
-import sqlite3
-from typing import Any, Optional
+import re
 
-# Directory that holds one <guild_id>.db per server.
-DATA_DIR = os.getenv("DATA_DIR", "data")
+import asyncpg
+
+_pool: asyncpg.Pool | None = None
+
+# Config columns that are Discord snowflakes — must be BIGINT in Postgres
+# (INTEGER/int4 would overflow). guild_id / discord_id are stored as TEXT.
+_ID_COLUMNS = (
+    "unverified_role_id", "verified_role_id", "category_id", "verify_channel_id",
+    "info_channel_id", "log_channel_id", "verify_message_id", "welcome_channel_id",
+    "setup_channel_id", "setup_panel_message_id", "member_list_channel_id",
+    "member_list_message_id", "general_channel_id", "community_category_id",
+    "memes_channel_id", "gifs_channel_id", "lobby_voice_id",
+    "points_board_channel_id", "points_board_message_id",
+    "points_admin_channel_id", "points_panel_message_id",
+    "war_category_id", "war_strategy_id", "war_voice_id",
+    "rally_leaders_channel_id", "rally_joiners_channel_id",
+    "rally_leader_role_id", "rally_joiner_role_id",
+    # Phase 4 — GUI tool pages (each panel channel + its posted panel message).
+    "tools_category_id",
+    "scout_channel_id", "scout_panel_message_id",
+    "locate_channel_id", "locate_panel_message_id",
+    "selfstats_channel_id", "selfstats_panel_message_id",
+    "kingdom_channel_id", "kingdom_panel_message_id",
+    "compare_channel_id", "compare_panel_message_id",
+    "commands_channel_id", "commands_panel_message_id",
+    "info_message_id", "manage_panel_message_id", "giftcode_channel_id",
+)
+# Small integer config columns.
+_INT_COLUMNS = ("allowed_kingdom", "allowed_level", "lockdown_existing")
+
+# Everything writable via upsert_config.
+CONFIG_FIELDS = _ID_COLUMNS + _INT_COLUMNS
 
 
 # ──────────────────────────────────────────────────────────────
-# Low-level helpers (synchronous; always called through asyncio.to_thread)
+# Pool + schema
 # ──────────────────────────────────────────────────────────────
-def _db_path(guild_id: int | str) -> str:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    return os.path.join(DATA_DIR, f"{guild_id}.db")
+def _clean_dsn(url: str) -> str:
+    # asyncpg doesn't understand libpq's channel_binding parameter — strip it.
+    return re.sub(r"[?&]channel_binding=\w+", "", url or "")
 
 
-def _connect(guild_id: int | str) -> sqlite3.Connection:
-    conn = sqlite3.connect(_db_path(guild_id))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+async def init_pool() -> None:
+    """Create the connection pool and ensure the schema exists."""
+    global _pool
+    if _pool is None:
+        url = os.getenv("DATABASE_URL")  # read at call time, after load_dotenv()
+        if not url:
+            raise RuntimeError("DATABASE_URL is not set in the environment / .env file.")
+        _pool = await asyncpg.create_pool(dsn=_clean_dsn(url), min_size=1, max_size=10)
+    await init_db()
 
 
-def _ensure_schema(guild_id: int | str) -> None:
-    conn = _connect(guild_id)
-    try:
-        conn.execute(
+async def close_pool() -> None:
+    global _pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None
+
+
+def _pool_or_raise() -> asyncpg.Pool:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized — call init_pool() first.")
+    return _pool
+
+
+async def init_db() -> None:
+    id_cols_sql = ",\n                ".join(f"{c} BIGINT" for c in _ID_COLUMNS)
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS config (
+                guild_id          TEXT PRIMARY KEY,
+                {id_cols_sql},
+                allowed_kingdom   INTEGER,
+                allowed_level     INTEGER,
+                lockdown_existing INTEGER DEFAULT 0
+            )
+            """
+        )
+        # Upgrade older config tables in place: add any columns introduced after
+        # the table was first created. CREATE TABLE IF NOT EXISTS never alters an
+        # existing table, so live databases would otherwise miss new columns.
+        for col in _ID_COLUMNS:
+            await conn.execute(f"ALTER TABLE config ADD COLUMN IF NOT EXISTS {col} BIGINT")
+        for col in _INT_COLUMNS:
+            await conn.execute(f"ALTER TABLE config ADD COLUMN IF NOT EXISTS {col} INTEGER")
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS players (
-                discord_id   TEXT PRIMARY KEY,
+                guild_id     TEXT NOT NULL,
+                discord_id   TEXT NOT NULL,
                 ingame_name  TEXT,
-                ingame_id    INTEGER UNIQUE,
+                ingame_id    BIGINT,
                 kingdom      INTEGER,
                 alliance     TEXT,
                 town_level   INTEGER,
-                verified_at  TEXT,
-                last_checked TEXT
+                verified_at  TIMESTAMPTZ,
+                last_checked TIMESTAMPTZ,
+                PRIMARY KEY (guild_id, discord_id)
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS config (
-                guild_id           TEXT PRIMARY KEY,
-                unverified_role_id INTEGER,
-                verified_role_id   INTEGER,
-                category_id        INTEGER,
-                verify_channel_id  INTEGER,
-                info_channel_id    INTEGER,
-                log_channel_id     INTEGER,
-                verify_message_id  INTEGER,
-                welcome_channel_id INTEGER,
-                setup_channel_id   INTEGER,
-                setup_panel_message_id INTEGER,
-                member_list_channel_id INTEGER,
-                member_list_message_id INTEGER,
-                general_channel_id INTEGER,
-                community_category_id INTEGER,
-                memes_channel_id   INTEGER,
-                gifs_channel_id    INTEGER,
-                lobby_voice_id     INTEGER,
-                points_board_channel_id INTEGER,
-                points_board_message_id INTEGER,
-                points_admin_channel_id INTEGER,
-                points_panel_message_id INTEGER,
-                war_category_id    INTEGER,
-                war_strategy_id    INTEGER,
-                war_voice_id       INTEGER,
-                rally_leaders_channel_id INTEGER,
-                rally_joiners_channel_id INTEGER,
-                rally_leader_role_id INTEGER,
-                rally_joiner_role_id INTEGER,
-                allowed_kingdom    INTEGER,
-                allowed_level      INTEGER,
-                lockdown_existing  INTEGER DEFAULT 0
-            )
-            """
-        )
-        conn.execute(
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS alliances (
-                tag                TEXT PRIMARY KEY,
+                guild_id           TEXT NOT NULL,
+                tag                TEXT NOT NULL,
                 name               TEXT,
-                member_role_id     INTEGER,
-                leader_role_id     INTEGER,
-                category_id        INTEGER,
-                chat_channel_id    INTEGER,
-                leaders_channel_id INTEGER,
-                voice_channel_id   INTEGER
+                member_role_id     BIGINT,
+                leader_role_id     BIGINT,
+                category_id        BIGINT,
+                chat_channel_id    BIGINT,
+                leaders_channel_id BIGINT,
+                voice_channel_id   BIGINT,
+                PRIMARY KEY (guild_id, tag)
             )
             """
         )
-        conn.execute(
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS warnings (
-                discord_id TEXT PRIMARY KEY,
-                count      INTEGER DEFAULT 0
+                guild_id   TEXT NOT NULL,
+                discord_id TEXT NOT NULL,
+                count      INTEGER DEFAULT 0,
+                PRIMARY KEY (guild_id, discord_id)
             )
             """
         )
-        conn.execute(
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS points (
-                discord_id TEXT PRIMARY KEY,
-                points     INTEGER DEFAULT 0
+                guild_id   TEXT NOT NULL,
+                discord_id TEXT NOT NULL,
+                points     INTEGER DEFAULT 0,
+                PRIMARY KEY (guild_id, discord_id)
             )
             """
         )
-        conn.execute(
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS announced_codes (
-                code       TEXT PRIMARY KEY,
-                created_at TEXT
+                guild_id   TEXT NOT NULL,
+                code       TEXT NOT NULL,
+                created_at TEXT,
+                PRIMARY KEY (guild_id, code)
             )
             """
         )
-        _migrate(conn)
-        conn.commit()
-    finally:
-        conn.close()
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
-    """Add columns introduced after a database was first created (phase-2+)."""
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(config)")}
-    added_columns = (
-        "welcome_channel_id",
-        "setup_channel_id",
-        "setup_panel_message_id",
-        "member_list_channel_id",
-        "member_list_message_id",
-        "general_channel_id",
-        "community_category_id",
-        "memes_channel_id",
-        "gifs_channel_id",
-        "lobby_voice_id",
-        "points_board_channel_id",
-        "points_board_message_id",
-        "points_admin_channel_id",
-        "points_panel_message_id",
-        "war_category_id",
-        "war_strategy_id",
-        "war_voice_id",
-        "rally_leaders_channel_id",
-        "rally_joiners_channel_id",
-        "rally_leader_role_id",
-        "rally_joiner_role_id",
-    )
-    for column in added_columns:
-        if column not in existing:
-            conn.execute(f"ALTER TABLE config ADD COLUMN {column} INTEGER")
-
-
-# ──────────────────────────────────────────────────────────────
-# Public async API — schema
-# ──────────────────────────────────────────────────────────────
-async def init_guild(guild_id: int | str) -> None:
-    """Create (if needed) the database file and tables for one guild."""
-    await asyncio.to_thread(_ensure_schema, guild_id)
-
-
-# ──────────────────────────────────────────────────────────────
-# Public async API — players
-# ──────────────────────────────────────────────────────────────
-def _save_player(guild_id, discord_id, ingame_name, ingame_id, kingdom, alliance, town_level) -> None:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO players
-                (discord_id, ingame_name, ingame_id, kingdom, alliance,
-                 town_level, verified_at, last_checked)
-            VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-            """,
-            (str(discord_id), ingame_name, ingame_id, kingdom, alliance, town_level),
+async def init_guild(guild_id) -> None:
+    """Ensure a config row exists for a guild (schema is global in Postgres)."""
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO config (guild_id) VALUES ($1) ON CONFLICT DO NOTHING", str(guild_id)
         )
-        conn.commit()
-    finally:
-        conn.close()
 
 
+def _player_row(record) -> dict:
+    d = dict(record)
+    for k in ("verified_at", "last_checked"):
+        if d.get(k) is not None and not isinstance(d[k], str):
+            d[k] = d[k].isoformat(sep=" ", timespec="seconds")
+    return d
+
+
+# ──────────────────────────────────────────────────────────────
+# Players
+# ──────────────────────────────────────────────────────────────
 async def save_player(guild_id, discord_id, ingame_name, ingame_id, kingdom, alliance, town_level=None):
-    await asyncio.to_thread(
-        _save_player, guild_id, discord_id, ingame_name, ingame_id, kingdom, alliance, town_level
-    )
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO players
+                (guild_id, discord_id, ingame_name, ingame_id, kingdom, alliance,
+                 town_level, verified_at, last_checked)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())
+            ON CONFLICT (guild_id, discord_id) DO UPDATE SET
+                ingame_name = EXCLUDED.ingame_name,
+                ingame_id   = EXCLUDED.ingame_id,
+                kingdom     = EXCLUDED.kingdom,
+                alliance    = EXCLUDED.alliance,
+                town_level  = EXCLUDED.town_level,
+                verified_at = now(),
+                last_checked = now()
+            """,
+            str(guild_id), str(discord_id), ingame_name, ingame_id, kingdom, alliance, town_level,
+        )
 
 
-def _get_player(guild_id, discord_id) -> Optional[dict]:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        row = conn.execute(
-            "SELECT * FROM players WHERE discord_id = ?", (str(discord_id),)
-        ).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-async def get_player(guild_id, discord_id) -> Optional[dict]:
-    return await asyncio.to_thread(_get_player, guild_id, discord_id)
-
-
-def _delete_player(guild_id, discord_id) -> None:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        conn.execute("DELETE FROM players WHERE discord_id = ?", (str(discord_id),))
-        conn.commit()
-    finally:
-        conn.close()
+async def get_player(guild_id, discord_id):
+    async with _pool_or_raise().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM players WHERE guild_id = $1 AND discord_id = $2",
+            str(guild_id), str(discord_id),
+        )
+        return _player_row(row) if row else None
 
 
 async def delete_player(guild_id, discord_id) -> None:
-    await asyncio.to_thread(_delete_player, guild_id, discord_id)
-
-
-def _all_players(guild_id) -> list[dict]:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        rows = conn.execute(
-            "SELECT * FROM players ORDER BY ingame_name COLLATE NOCASE"
-        ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            "DELETE FROM players WHERE guild_id = $1 AND discord_id = $2",
+            str(guild_id), str(discord_id),
+        )
 
 
 async def all_players(guild_id) -> list[dict]:
-    """Full roster for one guild (used by /roster export)."""
-    return await asyncio.to_thread(_all_players, guild_id)
-
-
-def _players_to_check(guild_id, limit: int) -> list[dict]:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        rows = conn.execute(
-            "SELECT * FROM players ORDER BY last_checked IS NULL DESC, last_checked ASC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
+    async with _pool_or_raise().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM players WHERE guild_id = $1 ORDER BY ingame_name",
+            str(guild_id),
+        )
+        return [_player_row(r) for r in rows]
 
 
 async def players_to_check(guild_id, limit: int = 25) -> list[dict]:
-    """Stalest-first slice of players for the name-change tracker."""
-    return await asyncio.to_thread(_players_to_check, guild_id, limit)
-
-
-def _update_player_name(guild_id, discord_id, new_name) -> None:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        conn.execute(
-            "UPDATE players SET ingame_name = ?, last_checked = datetime('now') WHERE discord_id = ?",
-            (new_name, str(discord_id)),
+    async with _pool_or_raise().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM players WHERE guild_id = $1 ORDER BY last_checked ASC NULLS FIRST LIMIT $2",
+            str(guild_id), limit,
         )
-        conn.commit()
-    finally:
-        conn.close()
+        return [_player_row(r) for r in rows]
 
 
 async def update_player_name(guild_id, discord_id, new_name) -> None:
-    await asyncio.to_thread(_update_player_name, guild_id, discord_id, new_name)
-
-
-def _touch_player(guild_id, discord_id) -> None:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        conn.execute(
-            "UPDATE players SET last_checked = datetime('now') WHERE discord_id = ?",
-            (str(discord_id),),
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            "UPDATE players SET ingame_name = $3, last_checked = now() WHERE guild_id = $1 AND discord_id = $2",
+            str(guild_id), str(discord_id), new_name,
         )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 async def touch_player(guild_id, discord_id) -> None:
-    """Stamp last_checked without changing the name (nothing changed this cycle)."""
-    await asyncio.to_thread(_touch_player, guild_id, discord_id)
-
-
-# ──────────────────────────────────────────────────────────────
-# Public async API — per-guild config (single row)
-# ──────────────────────────────────────────────────────────────
-def _get_config(guild_id) -> Optional[dict]:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        row = conn.execute(
-            "SELECT * FROM config WHERE guild_id = ?", (str(guild_id),)
-        ).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-async def get_config(guild_id) -> Optional[dict]:
-    return await asyncio.to_thread(_get_config, guild_id)
-
-
-# Columns that upsert_config is allowed to write.
-_CONFIG_FIELDS = (
-    "unverified_role_id",
-    "verified_role_id",
-    "category_id",
-    "verify_channel_id",
-    "info_channel_id",
-    "log_channel_id",
-    "verify_message_id",
-    "welcome_channel_id",
-    "setup_channel_id",
-    "setup_panel_message_id",
-    "member_list_channel_id",
-    "member_list_message_id",
-    "general_channel_id",
-    "community_category_id",
-    "memes_channel_id",
-    "gifs_channel_id",
-    "lobby_voice_id",
-    "points_board_channel_id",
-    "points_board_message_id",
-    "points_admin_channel_id",
-    "points_panel_message_id",
-    "war_category_id",
-    "war_strategy_id",
-    "war_voice_id",
-    "rally_leaders_channel_id",
-    "rally_joiners_channel_id",
-    "rally_leader_role_id",
-    "rally_joiner_role_id",
-    "allowed_kingdom",
-    "allowed_level",
-    "lockdown_existing",
-)
-
-
-def _upsert_config(guild_id, values: dict[str, Any]) -> None:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        # Ensure the row exists, then update only the provided fields so callers
-        # can save partial progress through the setup wizard.
-        conn.execute(
-            "INSERT OR IGNORE INTO config (guild_id) VALUES (?)", (str(guild_id),)
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            "UPDATE players SET last_checked = now() WHERE guild_id = $1 AND discord_id = $2",
+            str(guild_id), str(discord_id),
         )
-        fields = {k: v for k, v in values.items() if k in _CONFIG_FIELDS}
-        if fields:
-            assignments = ", ".join(f"{k} = ?" for k in fields)
-            params = list(fields.values()) + [str(guild_id)]
-            conn.execute(
-                f"UPDATE config SET {assignments} WHERE guild_id = ?", params
-            )
-        conn.commit()
-    finally:
-        conn.close()
 
 
-async def upsert_config(guild_id, **values) -> None:
-    """Create-or-update the guild's config row, writing only the given fields."""
-    await asyncio.to_thread(_upsert_config, guild_id, values)
-
-
-def _list_guild_ids() -> list[str]:
-    if not os.path.isdir(DATA_DIR):
-        return []
-    return [
-        os.path.splitext(f)[0]
-        for f in os.listdir(DATA_DIR)
-        if f.endswith(".db")
-    ]
-
-
-async def list_guild_ids() -> list[str]:
-    """Every guild that has a database file (used by the tracker loop)."""
-    return await asyncio.to_thread(_list_guild_ids)
-
-
-# ──────────────────────────────────────────────────────────────
-# Public async API — alliances
-# ──────────────────────────────────────────────────────────────
-def _add_alliance(guild_id, tag, name, member_role_id, leader_role_id,
-                  category_id, chat_channel_id, leaders_channel_id, voice_channel_id) -> None:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO alliances
-                (tag, name, member_role_id, leader_role_id, category_id,
-                 chat_channel_id, leaders_channel_id, voice_channel_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (tag, name, member_role_id, leader_role_id, category_id,
-             chat_channel_id, leaders_channel_id, voice_channel_id),
+async def player_by_ingame_id(guild_id, ingame_id):
+    """Who (if anyone) on this server has already claimed a given in-game player ID."""
+    async with _pool_or_raise().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM players WHERE guild_id = $1 AND ingame_id = $2",
+            str(guild_id), int(ingame_id),
         )
-        conn.commit()
-    finally:
-        conn.close()
+        return _player_row(row) if row else None
 
 
-async def add_alliance(guild_id, tag, name, member_role_id, leader_role_id,
-                       category_id, chat_channel_id, leaders_channel_id, voice_channel_id) -> None:
-    await asyncio.to_thread(
-        _add_alliance, guild_id, tag, name, member_role_id, leader_role_id,
-        category_id, chat_channel_id, leaders_channel_id, voice_channel_id,
-    )
-
-
-def _get_alliance(guild_id, tag) -> Optional[dict]:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        row = conn.execute(
-            "SELECT * FROM alliances WHERE tag = ?", (str(tag).upper(),)
-        ).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-async def get_alliance(guild_id, tag) -> Optional[dict]:
-    return await asyncio.to_thread(_get_alliance, guild_id, tag)
-
-
-def _all_alliances(guild_id) -> list[dict]:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        rows = conn.execute("SELECT * FROM alliances ORDER BY tag").fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
-async def all_alliances(guild_id) -> list[dict]:
-    return await asyncio.to_thread(_all_alliances, guild_id)
-
-
-def _delete_alliance(guild_id, tag) -> None:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        conn.execute("DELETE FROM alliances WHERE tag = ?", (str(tag).upper(),))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-async def delete_alliance(guild_id, tag) -> None:
-    await asyncio.to_thread(_delete_alliance, guild_id, tag)
-
-
-def _clear_alliances(guild_id) -> None:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        conn.execute("DELETE FROM alliances")
-        conn.commit()
-    finally:
-        conn.close()
-
-
-async def clear_alliances(guild_id) -> None:
-    """Remove every alliance row for a guild (used by the setup wipe)."""
-    await asyncio.to_thread(_clear_alliances, guild_id)
-
-
-def _players_by_alliance(guild_id, tag) -> list[dict]:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        rows = conn.execute(
-            "SELECT * FROM players WHERE alliance = ? ORDER BY ingame_name COLLATE NOCASE",
-            (str(tag).upper(),),
-        ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
+async def players_pending(guild_id) -> list[dict]:
+    """Players verified provisionally (no in-game name yet) — awaiting API backfill."""
+    async with _pool_or_raise().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM players WHERE guild_id = $1 AND ingame_name IS NULL "
+            "ORDER BY last_checked ASC NULLS FIRST",
+            str(guild_id),
+        )
+        return [_player_row(r) for r in rows]
 
 
 async def players_by_alliance(guild_id, tag) -> list[dict]:
-    """Every stored player whose alliance tag matches (used by /giftcode)."""
-    return await asyncio.to_thread(_players_by_alliance, guild_id, tag)
-
-
-# ──────────────────────────────────────────────────────────────
-# Public async API — moderation warnings
-# ──────────────────────────────────────────────────────────────
-def _add_warning(guild_id, discord_id) -> int:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        conn.execute(
-            """
-            INSERT INTO warnings (discord_id, count) VALUES (?, 1)
-            ON CONFLICT(discord_id) DO UPDATE SET count = count + 1
-            """,
-            (str(discord_id),),
+    async with _pool_or_raise().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM players WHERE guild_id = $1 AND alliance = $2 ORDER BY ingame_name",
+            str(guild_id), str(tag).upper(),
         )
-        conn.commit()
-        row = conn.execute(
-            "SELECT count FROM warnings WHERE discord_id = ?", (str(discord_id),)
-        ).fetchone()
-        return int(row["count"]) if row else 0
-    finally:
-        conn.close()
+        return [_player_row(r) for r in rows]
 
 
+# ──────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────
+async def get_config(guild_id):
+    async with _pool_or_raise().acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM config WHERE guild_id = $1", str(guild_id))
+        return dict(row) if row else None
+
+
+async def upsert_config(guild_id, **values) -> None:
+    fields = {k: v for k, v in values.items() if k in CONFIG_FIELDS}
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute("INSERT INTO config (guild_id) VALUES ($1) ON CONFLICT DO NOTHING", str(guild_id))
+        if fields:
+            cols = list(fields)
+            assignments = ", ".join(f"{col} = ${i + 2}" for i, col in enumerate(cols))
+            await conn.execute(
+                f"UPDATE config SET {assignments} WHERE guild_id = $1",
+                str(guild_id), *[fields[c] for c in cols],
+            )
+
+
+async def list_guild_ids() -> list[str]:
+    async with _pool_or_raise().acquire() as conn:
+        rows = await conn.fetch("SELECT guild_id FROM config")
+        return [r["guild_id"] for r in rows]
+
+
+# ──────────────────────────────────────────────────────────────
+# Alliances
+# ──────────────────────────────────────────────────────────────
+async def add_alliance(guild_id, tag, name, member_role_id, leader_role_id,
+                       category_id, chat_channel_id, leaders_channel_id, voice_channel_id) -> None:
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO alliances
+                (guild_id, tag, name, member_role_id, leader_role_id, category_id,
+                 chat_channel_id, leaders_channel_id, voice_channel_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (guild_id, tag) DO UPDATE SET
+                name = EXCLUDED.name,
+                member_role_id = EXCLUDED.member_role_id,
+                leader_role_id = EXCLUDED.leader_role_id,
+                category_id = EXCLUDED.category_id,
+                chat_channel_id = EXCLUDED.chat_channel_id,
+                leaders_channel_id = EXCLUDED.leaders_channel_id,
+                voice_channel_id = EXCLUDED.voice_channel_id
+            """,
+            str(guild_id), str(tag).upper(), name, member_role_id, leader_role_id,
+            category_id, chat_channel_id, leaders_channel_id, voice_channel_id,
+        )
+
+
+async def upsert_alliance_role(guild_id, tag, member_role_id) -> None:
+    """Record a ceremonial alliance role (tag → member role); no channels attached.
+
+    Used when a member's alliance (from the API) first appears on a server and we
+    auto-create just a role for it.
+    """
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO alliances (guild_id, tag, name, member_role_id)
+            VALUES ($1, $2, $2, $3)
+            ON CONFLICT (guild_id, tag) DO UPDATE SET member_role_id = EXCLUDED.member_role_id
+            """,
+            str(guild_id), str(tag).upper(), member_role_id,
+        )
+
+
+async def get_alliance(guild_id, tag):
+    async with _pool_or_raise().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM alliances WHERE guild_id = $1 AND tag = $2",
+            str(guild_id), str(tag).upper(),
+        )
+        return dict(row) if row else None
+
+
+async def all_alliances(guild_id) -> list[dict]:
+    async with _pool_or_raise().acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM alliances WHERE guild_id = $1 ORDER BY tag", str(guild_id))
+        return [dict(r) for r in rows]
+
+
+async def delete_alliance(guild_id, tag) -> None:
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            "DELETE FROM alliances WHERE guild_id = $1 AND tag = $2",
+            str(guild_id), str(tag).upper(),
+        )
+
+
+async def clear_alliances(guild_id) -> None:
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute("DELETE FROM alliances WHERE guild_id = $1", str(guild_id))
+
+
+# ──────────────────────────────────────────────────────────────
+# Warnings
+# ──────────────────────────────────────────────────────────────
 async def add_warning(guild_id, discord_id) -> int:
-    """Increment a member's strike count and return the new total."""
-    return await asyncio.to_thread(_add_warning, guild_id, discord_id)
-
-
-def _get_warning(guild_id, discord_id) -> int:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        row = conn.execute(
-            "SELECT count FROM warnings WHERE discord_id = ?", (str(discord_id),)
-        ).fetchone()
-        return int(row["count"]) if row else 0
-    finally:
-        conn.close()
+    async with _pool_or_raise().acquire() as conn:
+        return await conn.fetchval(
+            """
+            INSERT INTO warnings (guild_id, discord_id, count) VALUES ($1, $2, 1)
+            ON CONFLICT (guild_id, discord_id) DO UPDATE SET count = warnings.count + 1
+            RETURNING count
+            """,
+            str(guild_id), str(discord_id),
+        )
 
 
 async def get_warning(guild_id, discord_id) -> int:
-    return await asyncio.to_thread(_get_warning, guild_id, discord_id)
-
-
-def _reset_warning(guild_id, discord_id) -> None:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        conn.execute("DELETE FROM warnings WHERE discord_id = ?", (str(discord_id),))
-        conn.commit()
-    finally:
-        conn.close()
+    async with _pool_or_raise().acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT count FROM warnings WHERE guild_id = $1 AND discord_id = $2",
+            str(guild_id), str(discord_id),
+        )
+        return int(val) if val is not None else 0
 
 
 async def reset_warning(guild_id, discord_id) -> None:
-    """Clear a member's strikes (after escalation, or an admin reset)."""
-    await asyncio.to_thread(_reset_warning, guild_id, discord_id)
-
-
-# ──────────────────────────────────────────────────────────────
-# Public async API — contribution points
-# ──────────────────────────────────────────────────────────────
-def _award_points(guild_id, discord_id, delta) -> int:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        conn.execute("INSERT OR IGNORE INTO points (discord_id, points) VALUES (?, 0)", (str(discord_id),))
-        conn.execute(
-            "UPDATE points SET points = MAX(0, points + ?) WHERE discord_id = ?",
-            (int(delta), str(discord_id)),
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            "DELETE FROM warnings WHERE guild_id = $1 AND discord_id = $2",
+            str(guild_id), str(discord_id),
         )
-        conn.commit()
-        row = conn.execute("SELECT points FROM points WHERE discord_id = ?", (str(discord_id),)).fetchone()
-        return int(row["points"]) if row else 0
-    finally:
-        conn.close()
 
 
+# ──────────────────────────────────────────────────────────────
+# Contribution points
+# ──────────────────────────────────────────────────────────────
 async def award_points(guild_id, discord_id, delta) -> int:
-    """Add (or subtract, if delta<0) points; total is clamped at 0. Returns new total."""
-    return await asyncio.to_thread(_award_points, guild_id, discord_id, delta)
-
-
-def _get_points(guild_id, discord_id) -> int:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        row = conn.execute("SELECT points FROM points WHERE discord_id = ?", (str(discord_id),)).fetchone()
-        return int(row["points"]) if row else 0
-    finally:
-        conn.close()
+    async with _pool_or_raise().acquire() as conn:
+        return await conn.fetchval(
+            """
+            INSERT INTO points (guild_id, discord_id, points) VALUES ($1, $2, GREATEST(0, $3))
+            ON CONFLICT (guild_id, discord_id) DO UPDATE SET points = GREATEST(0, points.points + $3)
+            RETURNING points
+            """,
+            str(guild_id), str(discord_id), int(delta),
+        )
 
 
 async def get_points(guild_id, discord_id) -> int:
-    return await asyncio.to_thread(_get_points, guild_id, discord_id)
-
-
-def _all_points(guild_id) -> list[dict]:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        rows = conn.execute(
-            "SELECT discord_id, points FROM points WHERE points > 0 ORDER BY points DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
+    async with _pool_or_raise().acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT points FROM points WHERE guild_id = $1 AND discord_id = $2",
+            str(guild_id), str(discord_id),
+        )
+        return int(val) if val is not None else 0
 
 
 async def all_points(guild_id) -> list[dict]:
-    """All members with a positive points total, highest first."""
-    return await asyncio.to_thread(_all_points, guild_id)
-
-
-# ──────────────────────────────────────────────────────────────
-# Public async API — announced gift codes (auto-announce dedupe)
-# ──────────────────────────────────────────────────────────────
-def _mark_code_announced(guild_id, code, created_at) -> bool:
-    """Returns True if this is a NEW code (inserted), False if already announced."""
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO announced_codes (code, created_at) VALUES (?, ?)",
-            (str(code), created_at),
+    async with _pool_or_raise().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT discord_id, points FROM points WHERE guild_id = $1 AND points > 0 ORDER BY points DESC",
+            str(guild_id),
         )
-        conn.commit()
-        return cur.rowcount > 0
-    finally:
-        conn.close()
+        return [dict(r) for r in rows]
 
 
+# ──────────────────────────────────────────────────────────────
+# Announced gift codes
+# ──────────────────────────────────────────────────────────────
 async def mark_code_announced(guild_id, code, created_at=None) -> bool:
-    return await asyncio.to_thread(_mark_code_announced, guild_id, code, created_at)
-
-
-def _code_already_announced(guild_id, code) -> bool:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        row = conn.execute("SELECT 1 FROM announced_codes WHERE code = ?", (str(code),)).fetchone()
+    """Insert a code; returns True if NEW (first time), False if already there."""
+    async with _pool_or_raise().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO announced_codes (guild_id, code, created_at) VALUES ($1, $2, $3)
+            ON CONFLICT (guild_id, code) DO NOTHING
+            RETURNING code
+            """,
+            str(guild_id), str(code), created_at,
+        )
         return row is not None
-    finally:
-        conn.close()
 
 
 async def code_already_announced(guild_id, code) -> bool:
-    return await asyncio.to_thread(_code_already_announced, guild_id, code)
-
-
-def _announced_count(guild_id) -> int:
-    _ensure_schema(guild_id)
-    conn = _connect(guild_id)
-    try:
-        row = conn.execute("SELECT COUNT(*) AS n FROM announced_codes").fetchone()
-        return int(row["n"]) if row else 0
-    finally:
-        conn.close()
+    async with _pool_or_raise().acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT 1 FROM announced_codes WHERE guild_id = $1 AND code = $2",
+            str(guild_id), str(code),
+        )
+        return val is not None
 
 
 async def announced_count(guild_id) -> int:
-    """How many codes we've recorded — 0 means this guild has never polled."""
-    return await asyncio.to_thread(_announced_count, guild_id)
+    async with _pool_or_raise().acquire() as conn:
+        return int(await conn.fetchval(
+            "SELECT COUNT(*) FROM announced_codes WHERE guild_id = $1", str(guild_id)
+        ))

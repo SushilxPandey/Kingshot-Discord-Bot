@@ -1,14 +1,19 @@
 """
-Verification flow (self-attested model).
+Verification flow (API-driven, ID only).
 
-Kingshot removed its public player-lookup API, so the bot can no longer confirm a
-player's identity from the game. Instead:
+Members enter only their in-game ID. The bot looks them up live on kingshotstats
+and pulls their real name, kingdom, Town Center level, and alliance:
 
-  * ``handle_verification`` trusts the details the member types (in-game ID, name,
-    kingdom, alliance), records them, swaps Unverified → Verified, sets the
-    nickname, announces it in general, and writes an audit line to the admin log.
-  * ``on_member_join`` auto-assigns the Unverified role so every newcomer is gated
-    to the verify channel until they verify.
+  * **Found:** confirm the kingdom matches this server and they meet the Town Center
+    requirement, then verify them, set their nickname from the real name, and grant a
+    ceremonial role for their in-game alliance (auto-created the first time that
+    alliance appears — no channels, just a label).
+  * **Not found (but the site is up):** reject — the ID is probably wrong.
+  * **Site unreachable:** provisional pass on the ID alone; the tracker backfills their
+    name/kingdom/alliance automatically once the site is reachable again.
+
+``on_member_join`` auto-assigns the Unverified role so every newcomer is gated to the
+verify channel until they verify.
 """
 
 import logging
@@ -17,6 +22,7 @@ import discord
 from discord.ext import commands
 
 import database
+import kingshot_api
 
 
 class Verification(commands.Cog, name="Verification"):
@@ -25,11 +31,7 @@ class Verification(commands.Cog, name="Verification"):
 
     # ── called by views.verify_view.VerifyModal ───────────────
     async def handle_verification(self, interaction: discord.Interaction, ingame_id: int,
-                                  ingame_name: str, kingdom: int, alliance: str | None = None,
                                   is_reverify: bool = False):
-        # Self-attested: Kingshot removed the public player-lookup API, so the bot
-        # trusts the details the member enters, records them, grants roles, and
-        # writes an audit line to the admin log for spot-checking.
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
         member = interaction.user
@@ -43,50 +45,103 @@ class Verification(commands.Cog, name="Verification"):
             return
 
         allowed_kingdom = config["allowed_kingdom"]
+        allowed_level = config.get("allowed_level") or 0
 
-        # Validate the alliance tag against the ones the owner created.
-        alliance = (alliance or "").strip().upper()
-        valid_tags = {a["tag"] for a in await database.all_alliances(guild.id)}
-        if valid_tags and alliance not in valid_tags:
+        # One in-game player may only be linked to one Discord account per server.
+        claim = await database.player_by_ingame_id(guild.id, ingame_id)
+        if claim and str(claim.get("discord_id")) != str(member.id):
             await interaction.followup.send(
-                "That alliance isn't set up here. Valid tags: " + ", ".join(sorted(valid_tags)),
+                f"In-game player **{ingame_id}** is already linked to another member on this "
+                "server. If that's a mistake, ask an admin to unverify the other account first.",
                 ephemeral=True,
             )
             return
 
-        # Soft kingdom check against the entered value.
-        if kingdom != allowed_kingdom:
+        # Live lookup by game ID. Distinguish "site down" (exception) from
+        # "site up but no such player" (empty data) — they're handled differently.
+        reachable = True
+        lookup = None
+        try:
+            info = await kingshot_api.get_player_info(ingame_id)
+            lookup = info.get("data") or None
+        except Exception:
+            reachable = False
+
+        if lookup:
+            try:
+                real_kingdom = int(lookup.get("kingdom"))
+            except (TypeError, ValueError):
+                real_kingdom = None
+            try:
+                real_level = int(lookup.get("level"))
+            except (TypeError, ValueError):
+                real_level = 0
+            if real_kingdom != allowed_kingdom:
+                await interaction.followup.send(
+                    f"That account is in kingdom **{real_kingdom}**, but this server only "
+                    f"allows kingdom **{allowed_kingdom}**.",
+                    ephemeral=True,
+                )
+                return
+            if allowed_level and real_level < allowed_level:
+                await interaction.followup.send(
+                    f"You must be at least Town Center **{allowed_level}** to verify "
+                    f"(that account is TC {real_level}).",
+                    ephemeral=True,
+                )
+                return
+            ingame_name = (lookup.get("name") or f"Player {ingame_id}").strip()[:32]
+            kingdom = real_kingdom
+            town_level = real_level
+            tag = (lookup.get("alliance_abbr") or "").strip().upper() or None
+            source = "✅ live-verified"
+        elif reachable:
+            # Site is up but returned no record — almost always a mistyped ID.
             await interaction.followup.send(
-                f"Only kingdom **{allowed_kingdom}** is allowed on this server.",
+                f"I couldn't find a Kingshot player with ID **{ingame_id}**. "
+                "Double-check your in-game ID (Profile → the number under your name) and try again.",
                 ephemeral=True,
             )
             return
+        else:
+            # Site unreachable → provisional pass on the ID alone; tracker fills the rest.
+            ingame_name = None
+            kingdom = allowed_kingdom
+            town_level = None
+            tag = None
+            source = "⏳ provisional (lookup unavailable — will backfill)"
 
-        ingame_name = ingame_name.strip()[:32]
-
-        # Remember the previous alliance so we can swap roles on a change / reverify.
+        # Remember the previous alliance so we can swap the ceremonial role on a change.
         existing = await database.get_player(guild.id, member.id)
         old_tag = (existing or {}).get("alliance")
 
-        # Save to THIS guild's database (level unknown — no API to fetch it).
         await database.save_player(
-            guild.id, member.id, ingame_name, ingame_id, kingdom, alliance, None
+            guild.id, member.id, ingame_name, ingame_id, kingdom, tag, town_level
         )
 
         # Role swap + nickname.
         verified_role = guild.get_role(config["verified_role_id"])
         unverified_role = guild.get_role(config["unverified_role_id"])
         note = await self._apply_verified_state(
-            member, verified_role, unverified_role, kingdom, alliance, ingame_name
+            member, verified_role, unverified_role, kingdom, tag, ingame_name
         )
-        await self._sync_alliance_roles(member, old_tag, alliance)
+        await self._sync_alliance_roles(member, old_tag, tag)
 
         verb = "re-verified" if is_reverify else "verified"
-        alliance_txt = f" in **{alliance}**" if alliance else ""
-        await interaction.followup.send(
-            f"✅ You're {verb} as **{ingame_name}**{alliance_txt}! Welcome in." + note,
-            ephemeral=True,
-        )
+        display = ingame_name or f"ID {ingame_id}"
+        alliance_txt = f" in **{tag}**" if tag else ""
+        if lookup:
+            await interaction.followup.send(
+                f"✅ You're {verb} as **{display}**{alliance_txt}! Welcome in." + note,
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "✅ You're verified for now on your game ID. The game stats site is briefly "
+                "unreachable, so I'll fill in your name, kingdom, and alliance automatically "
+                "within the next little while." + note,
+                ephemeral=True,
+            )
 
         # Public announcement in the general channel (visible to everyone).
         general_id = config.get("general_channel_id")
@@ -94,19 +149,19 @@ class Verification(commands.Cog, name="Verification"):
             channel = guild.get_channel(int(general_id))
             if channel:
                 try:
-                    await channel.send(f"✅ **{ingame_name}**{alliance_txt} has verified — welcome!")
+                    await channel.send(f"✅ **{display}**{alliance_txt} has verified — welcome!")
                 except discord.HTTPException:
                     pass
 
-        # Admin audit log (this is the "auditable" half of the chosen model).
+        # Admin audit log.
         log_id = config.get("log_channel_id")
         if log_id:
             log_channel = guild.get_channel(int(log_id))
             if log_channel:
                 try:
                     await log_channel.send(
-                        f"🔎 {member.mention} {verb} — name **{ingame_name}**, "
-                        f"kingdom **{kingdom}**, alliance **{alliance or '—'}**, ID `{ingame_id}`"
+                        f"🔎 {member.mention} {verb} ({source}) — name **{display}**, "
+                        f"kingdom **{kingdom}**, alliance **{tag or '—'}**, ID `{ingame_id}`"
                     )
                 except discord.HTTPException:
                     pass
@@ -116,12 +171,27 @@ class Verification(commands.Cog, name="Verification"):
         if setup_cog:
             await setup_cog.refresh_member_list(guild)
 
+    async def ensure_alliance_role(self, guild: discord.Guild, tag: str) -> discord.Role | None:
+        """Find or create the ceremonial role for an in-game alliance tag (no channels)."""
+        if not tag:
+            return None
+        record = await database.get_alliance(guild.id, tag)
+        role = guild.get_role(record["member_role_id"]) if record and record.get("member_role_id") else None
+        if role is None:
+            try:
+                role = await guild.create_role(name=tag, mentionable=True, reason="Kingshot alliance (from API)")
+            except discord.HTTPException:
+                logging.warning("Could not create ceremonial role %s in %s", tag, guild.id)
+                return None
+            await database.upsert_alliance_role(guild.id, tag, role.id)
+        return role
+
     async def _sync_alliance_roles(self, member, old_tag, new_tag):
-        """Remove the previous alliance's member role and grant the new one."""
+        """Remove the previous alliance's ceremonial role and grant the new one."""
         guild = member.guild
         if old_tag and old_tag != new_tag:
             old = await database.get_alliance(guild.id, old_tag)
-            if old:
+            if old and old.get("member_role_id"):
                 role = guild.get_role(old["member_role_id"])
                 if role and role in member.roles:
                     try:
@@ -129,14 +199,12 @@ class Verification(commands.Cog, name="Verification"):
                     except discord.HTTPException:
                         pass
         if new_tag:
-            new = await database.get_alliance(guild.id, new_tag)
-            if new:
-                role = guild.get_role(new["member_role_id"])
-                if role and role not in member.roles:
-                    try:
-                        await member.add_roles(role, reason="Kingshot alliance member")
-                    except discord.HTTPException:
-                        pass
+            role = await self.ensure_alliance_role(guild, new_tag)
+            if role and role not in member.roles:
+                try:
+                    await member.add_roles(role, reason="Kingshot alliance member")
+                except discord.HTTPException:
+                    pass
 
     async def _apply_verified_state(self, member, verified_role, unverified_role, kingdom, alliance, ingame_name) -> str:
         note = ""
@@ -149,13 +217,15 @@ class Verification(commands.Cog, name="Verification"):
             note += "\n⚠️ I couldn't update your roles — my role may be too low in the list."
             logging.warning("Role update forbidden for %s in guild %s", member, member.guild.id)
 
-        nick = f"[{kingdom}] {alliance}- {ingame_name}"[:32]
-        try:
-            await member.edit(nick=nick, reason="Kingshot verified")
-        except discord.Forbidden:
-            note += "\n⚠️ I couldn't change your nickname (server owners and higher roles can't be renamed by bots)."
-        except discord.HTTPException:
-            pass
+        if ingame_name:
+            tag_part = f"{alliance}- " if alliance else ""
+            nick = f"[{kingdom}] {tag_part}{ingame_name}"[:32]
+            try:
+                await member.edit(nick=nick, reason="Kingshot verified")
+            except discord.Forbidden:
+                note += "\n⚠️ I couldn't change your nickname (server owners and higher roles can't be renamed by bots)."
+            except discord.HTTPException:
+                pass
         return note
 
     # ── gate every newcomer ───────────────────────────────────
@@ -185,7 +255,7 @@ class Verification(commands.Cog, name="Verification"):
                 embed = discord.Embed(
                     description=(
                         f"👋 Welcome {member.mention} to **{member.guild.name}**!\n"
-                        "Head to the verify channel and tap **Verify** to unlock the server."
+                        "Head to the verify channel and tap **Verify** — just enter your in-game ID."
                     ),
                     color=discord.Color.blurple(),
                 )

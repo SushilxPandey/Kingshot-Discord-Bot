@@ -24,6 +24,27 @@ BADWORDS_FILE = os.getenv("BADWORDS_FILE", "badwords.txt")
 WARN_LIMIT = 5                       # strike that triggers the timeout
 TIMEOUT_DURATION = timedelta(hours=1)
 
+# A message counts as a GIF if it carries a .gif/animated attachment, a
+# gif-bearing embed, or a link to a known GIF host / a .gif URL.
+_GIF_HOSTS = ("tenor.com", "giphy.com", "gfycat.com", "media.discordapp.net")
+_GIF_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _is_gif_message(message: discord.Message) -> bool:
+    for att in message.attachments:
+        name = (att.filename or "").lower()
+        ctype = (att.content_type or "").lower()
+        if name.endswith(".gif") or ctype == "image/gif":
+            return True
+    for emb in message.embeds:
+        if emb.type in ("gifv", "image", "video"):
+            return True
+    for url in _GIF_URL_RE.findall(message.content or ""):
+        low = url.lower()
+        if low.endswith(".gif") or any(host in low for host in _GIF_HOSTS):
+            return True
+    return False
+
 
 def _load_bad_words() -> list[str]:
     try:
@@ -42,6 +63,21 @@ class Moderation(commands.Cog, name="Moderation"):
         # words in a row are all masked in a single left-to-right pass (the old
         # word-by-word loop could corrupt an overlapping match).
         self.pattern = self._compile(self.bad_words)
+        # guild_id -> gifs channel id, so on_message stays cheap (no DB hit).
+        self.gif_channels: dict[int, int] = {}
+
+    def note_gifs_channel(self, guild_id, channel_id):
+        """Called by setup so the gifs-only filter knows which channel to police."""
+        if channel_id:
+            self.gif_channels[int(guild_id)] = int(channel_id)
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # Warm the gifs-channel cache from config for every guild.
+        for guild_id in await database.list_guild_ids():
+            config = await database.get_config(guild_id) or {}
+            if config.get("gifs_channel_id"):
+                self.gif_channels[int(guild_id)] = int(config["gifs_channel_id"])
 
     @staticmethod
     def _compile(words):
@@ -52,7 +88,25 @@ class Moderation(commands.Cog, name="Moderation"):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot or message.guild is None or not self.pattern:
+        if message.author.bot or message.guild is None:
+            return
+
+        # Gifs-only channel: anything that isn't a GIF gets removed.
+        gif_cid = self.gif_channels.get(message.guild.id)
+        if gif_cid and message.channel.id == gif_cid and not _is_gif_message(message):
+            try:
+                await message.delete()
+                await message.channel.send(
+                    f"{message.author.mention} only **GIFs** can be posted here. 🎞️",
+                    delete_after=8,
+                )
+            except discord.Forbidden:
+                logging.warning("Missing permission to police gifs channel in %s", message.guild.id)
+            except discord.HTTPException:
+                pass
+            return
+
+        if not self.pattern:
             return
 
         cleaned = self.pattern.sub(lambda m: "*" * len(m.group()), message.content)

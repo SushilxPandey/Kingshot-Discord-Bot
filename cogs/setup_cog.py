@@ -1,18 +1,20 @@
 """
 Setup control room + provisioning.
 
-Setup is driven from an **owner-only `bot-setup` channel** that holds a persistent
-control panel (Setup / Re-Setup / Add Alliance / Remove Alliance buttons). Both
-Setup and Re-Setup first **wipe every bot-created role and channel** (except the
-setup channel; the player DB is kept) and then rebuild from scratch:
+Setup is driven from an **owner-only `bot-setup` channel** holding a persistent
+Setup / Re-Setup panel. Both actions first **wipe every bot-created role and channel**
+(except the setup channel; the player DB is kept) and rebuild from scratch:
 
-  * Unverified / Verified roles (referenced by ID);
-  * a Bot Center category (verify / info / log / welcome / general channels);
-  * a War category (strategy / voice / rally-leaders / rally-joiners) visible to
-    all Verified, plus Rally Leaders / Rally Joiners ping roles;
+  * Unverified / Verified roles;
+  * a Bot Center category — verify / bot-info / bot-log / welcome / member-list;
+  * a Community section — general / memes / gifs / Lobby voice;
+  * a War group — strategy / voice / rally-leaders / rally-joiners + Rally roles;
+  * a **Bot Tools** section of button-driven tool pages — Scout / Locate / Look
+    Yourself / Kingdom / Compare (buttons only) and a Bot Commands page (commands only);
   * a server-wide lockdown so Unverified sees only verify + welcome.
 
-Alliances are added/removed from the same panel. Only tracked IDs are ever
+Alliances are no longer created here — a member's alliance comes from the game API and
+gets a ceremonial role on demand (see the Verification cog). Only tracked IDs are ever
 deleted, so the server's own roles and channels are never touched.
 """
 
@@ -32,17 +34,25 @@ LOG_CHANNEL_NAME = "bot-log"
 WELCOME_CHANNEL_NAME = "welcome"
 SETUP_CHANNEL_NAME = "bot-setup"
 MEMBER_LIST_CHANNEL_NAME = "member-list"
-AWARD_CHANNEL_NAME = "award-points"
 UNVERIFIED_ROLE_NAME = "Unverified"
 VERIFIED_ROLE_NAME = "Verified"
 
 # Community (social) section — lives OUTSIDE the bot category.
 COMMUNITY_CATEGORY_NAME = "💬 Community"
 GENERAL_CHANNEL_NAME = "general"
+GIFTCODE_CHANNEL_NAME = "gift-codes"
 MEMES_CHANNEL_NAME = "memes"
 GIFS_CHANNEL_NAME = "gifs"
 LOBBY_VOICE_NAME = "Lobby"
-LEADERBOARD_CHANNEL_NAME = "leaderboard"
+
+# Bot Tools section — button-first tool pages.
+TOOLS_CATEGORY_NAME = "🛰️ Bot Tools"
+SCOUT_CHANNEL_NAME = "scout-opponents"
+LOCATE_CHANNEL_NAME = "locate-player"
+SELFSTATS_CHANNEL_NAME = "my-stats"
+KINGDOM_CHANNEL_NAME = "kingdom-intel"
+COMPARE_CHANNEL_NAME = "compare-players"
+COMMANDS_CHANNEL_NAME = "bot-commands"
 
 SETUP_MSG_TTL = 15                   # setup status messages self-delete after 15s
 
@@ -54,7 +64,6 @@ RALLY_JOINERS_CHANNEL = "rally-joiners"
 RALLY_LEADER_ROLE = "Rally Leaders"
 RALLY_JOINER_ROLE = "Rally Joiners"
 
-LEADER_ROLE_SUFFIX = "Leaders"      # alliance leader role = "<TAG> Leaders"
 VANISH_SECONDS = 3600               # public setup notices self-delete after an hour
 
 REQUIRED_PERMS = {
@@ -73,14 +82,13 @@ def missing_permissions(me: discord.Member) -> list[str]:
 # Wizard + panel UI
 # ──────────────────────────────────────────────────────────────
 class SetupModal(discord.ui.Modal, title="Bot Setup"):
-    """One pop-up that collects everything: kingdom + alliances."""
+    """One pop-up that collects the kingdom + minimum Town Center level."""
     kingdom = discord.ui.TextInput(
         label="Allowed kingdom number", placeholder="e.g. 466", required=True, max_length=10
     )
-    alliances = discord.ui.TextInput(
-        label="Alliances — comma-separated tags",
-        placeholder="e.g. RTL, XYZ, ABC   (leave blank to add later)",
-        required=False, style=discord.TextStyle.paragraph, max_length=200,
+    min_level = discord.ui.TextInput(
+        label="Minimum Town Center level (0 = no limit)",
+        placeholder="e.g. 10", required=True, max_length=3, default="0",
     )
 
     def __init__(self, cog: "SetupCog", wipe: bool = True):
@@ -90,60 +98,11 @@ class SetupModal(discord.ui.Modal, title="Bot Setup"):
 
     async def on_submit(self, interaction: discord.Interaction):
         raw_k = str(self.kingdom.value).strip()
-        if not raw_k.isdigit():
-            await interaction.response.send_message("Kingdom must be a number.", ephemeral=True)
+        raw_l = str(self.min_level.value).strip() or "0"
+        if not raw_k.isdigit() or not raw_l.isdigit():
+            await interaction.response.send_message("Kingdom and level must be numbers.", ephemeral=True)
             return
-        tags = SetupCog.parse_alliance_tags(str(self.alliances.value or ""))
-        await self.cog.run_provision(interaction, int(raw_k), wipe=self.wipe, alliance_tags=tags)
-
-
-class AllianceModal(discord.ui.Modal, title="Add an alliance"):
-    tag = discord.ui.TextInput(
-        label="Alliance tag (letters/numbers)", placeholder="e.g. RTL",
-        min_length=2, max_length=4, required=True
-    )
-    name = discord.ui.TextInput(label="Full alliance name (optional)", required=False, max_length=50)
-
-    def __init__(self, cog: "SetupCog"):
-        super().__init__()
-        self.cog = cog
-
-    async def on_submit(self, interaction: discord.Interaction):
-        tag = str(self.tag.value).strip().upper()
-        if not tag.isalnum():
-            await interaction.response.send_message("Tag must be letters or numbers only.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        alliance = await self.cog.provision_alliance(interaction.guild, tag, str(self.name.value).strip() or None)
-        member_role = interaction.guild.get_role(alliance["member_role_id"])
-        leader_role = interaction.guild.get_role(alliance["leader_role_id"])
-        await interaction.followup.send(
-            f"✅ Alliance **{tag}** ready — {member_role.mention} / {leader_role.mention} and its "
-            f"channel group. Give the **{tag} Leaders** role to its leaders.",
-            ephemeral=True,
-        )
-
-
-class RemoveAllianceSelect(discord.ui.Select):
-    def __init__(self, cog: "SetupCog", alliances: list[dict]):
-        self.cog = cog
-        options = [
-            discord.SelectOption(label=a["tag"], description=(a.get("name") or a["tag"])[:100])
-            for a in alliances[:25]
-        ]
-        super().__init__(placeholder="Pick an alliance to remove…", options=options, min_values=1, max_values=1)
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        tag = self.values[0]
-        await self.cog.remove_alliance(interaction.guild, tag)
-        await interaction.followup.send(f"🗑️ Removed alliance **{tag}** and its roles/channels.", ephemeral=True)
-
-
-class RemoveAllianceView(discord.ui.View):
-    def __init__(self, cog: "SetupCog", alliances: list[dict]):
-        super().__init__(timeout=180)
-        self.add_item(RemoveAllianceSelect(cog, alliances))
+        await self.cog.run_provision(interaction, int(raw_k), level=int(raw_l), wipe=self.wipe)
 
 
 class SetupPanelView(discord.ui.View):
@@ -164,18 +123,21 @@ class SetupPanelView(discord.ui.View):
             await interaction.response.send_message("Setup is unavailable right now.", ephemeral=True)
         return cog
 
+    def _perm_gate(self, interaction) -> str | None:
+        missing = missing_permissions(interaction.guild.me)
+        if missing:
+            return ("I'm missing these permissions: " + ", ".join(missing)
+                    + ". Grant them and make sure my role is near the top, then try again.")
+        return None
+
     @discord.ui.button(label="Setup", style=discord.ButtonStyle.success, emoji="🛠️", custom_id="ks_setup")
     async def setup_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         cog = await self._guard(interaction)
         if not cog:
             return
-        missing = missing_permissions(interaction.guild.me)
-        if missing:
-            await interaction.response.send_message(
-                "I'm missing these permissions: " + ", ".join(missing)
-                + ". Grant them and make sure my role is near the top, then try again.",
-                ephemeral=True,
-            )
+        gate = self._perm_gate(interaction)
+        if gate:
+            await interaction.response.send_message(gate, ephemeral=True)
             return
         await interaction.response.send_modal(SetupModal(cog, wipe=True))
 
@@ -184,37 +146,11 @@ class SetupPanelView(discord.ui.View):
         cog = await self._guard(interaction)
         if not cog:
             return
-        missing = missing_permissions(interaction.guild.me)
-        if missing:
-            await interaction.response.send_message(
-                "I'm missing these permissions: " + ", ".join(missing) + ".", ephemeral=True
-            )
+        gate = self._perm_gate(interaction)
+        if gate:
+            await interaction.response.send_message(gate, ephemeral=True)
             return
         await interaction.response.send_modal(SetupModal(cog, wipe=True))
-
-    @discord.ui.button(label="Add Alliance", style=discord.ButtonStyle.primary, emoji="➕", custom_id="ks_addalliance")
-    async def add_alliance_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cog = await self._guard(interaction)
-        if not cog:
-            return
-        config = await database.get_config(interaction.guild.id)
-        if not config or not config.get("verified_role_id"):
-            await interaction.response.send_message("Run **Setup** first.", ephemeral=True)
-            return
-        await interaction.response.send_modal(AllianceModal(cog))
-
-    @discord.ui.button(label="Remove Alliance", style=discord.ButtonStyle.secondary, emoji="🗑️", custom_id="ks_removealliance")
-    async def remove_alliance_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cog = await self._guard(interaction)
-        if not cog:
-            return
-        alliances = await database.all_alliances(interaction.guild.id)
-        if not alliances:
-            await interaction.response.send_message("There are no alliances to remove.", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            "Pick an alliance to remove:", view=RemoveAllianceView(cog, alliances), ephemeral=True
-        )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -224,7 +160,7 @@ class SetupCog(commands.Cog, name="Setup"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # ── slash bootstrap + legacy commands ─────────────────────
+    # ── slash bootstrap ───────────────────────────────────────
     @app_commands.command(name="setup", description="Open the bot control panel. Admins only.")
     @app_commands.default_permissions(administrator=True)
     @app_commands.guild_only()
@@ -239,8 +175,7 @@ class SetupCog(commands.Cog, name="Setup"):
         await interaction.response.defer(ephemeral=True, thinking=True)
         channel = await self.ensure_setup_channel(interaction.guild)
         await interaction.followup.send(
-            f"Your control panel is ready in {channel.mention} — use the buttons there to set up "
-            "the bot, add alliances, and more.",
+            f"Your control panel is ready in {channel.mention} — use the buttons there to set up the bot.",
             ephemeral=True,
         )
 
@@ -253,113 +188,49 @@ class SetupCog(commands.Cog, name="Setup"):
             await interaction.response.send_message("Run setup first.", ephemeral=True)
             return
         await self.run_provision(
-            interaction, config["allowed_kingdom"], wipe=False, reapply_backfill=False,
+            interaction, config["allowed_kingdom"], level=config.get("allowed_level") or 0,
+            wipe=False, reapply_backfill=False,
         )
 
-    @staticmethod
-    def parse_alliance_tags(text: str) -> list[str]:
-        """Parse a comma/space-separated tag list into unique valid tags."""
-        seen, tags = set(), []
-        for raw in text.replace(",", " ").split():
-            tag = raw.strip().upper()
-            if tag.isalnum() and 2 <= len(tag) <= 4 and tag not in seen:
-                seen.add(tag)
-                tags.append(tag)
-        return tags
-
-    alliance = app_commands.Group(
-        name="alliance", description="Manage alliances (admins only).",
-        default_permissions=discord.Permissions(administrator=True), guild_only=True,
-    )
-
-    @alliance.command(name="add", description="Create an alliance: role, leader role, and channel group.")
-    @app_commands.describe(tag="Short alliance tag (letters/numbers)", name="Optional full name")
-    async def alliance_add(self, interaction: discord.Interaction, tag: str, name: str | None = None):
-        config = await database.get_config(interaction.guild.id)
-        if not config or not config.get("verified_role_id"):
-            await interaction.response.send_message("Run setup first.", ephemeral=True)
-            return
-        tag = tag.strip().upper()
-        if not tag.isalnum() or not (2 <= len(tag) <= 4):
-            await interaction.response.send_message("Tag must be 2–4 letters/numbers.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        alliance = await self.provision_alliance(interaction.guild, tag, name)
-        member_role = interaction.guild.get_role(alliance["member_role_id"])
-        leader_role = interaction.guild.get_role(alliance["leader_role_id"])
-        await interaction.followup.send(
-            f"✅ Alliance **{tag}** ready — {member_role.mention} / {leader_role.mention}.",
-            ephemeral=True,
-        )
-
-    @alliance.command(name="remove", description="Delete an alliance's roles and channels.")
-    @app_commands.describe(tag="The alliance tag to remove")
-    async def alliance_remove(self, interaction: discord.Interaction, tag: str):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        ok = await self.remove_alliance(interaction.guild, tag)
-        msg = f"🗑️ Removed alliance **{tag.upper()}**." if ok else f"No alliance tagged **{tag.upper()}**."
-        await interaction.followup.send(msg, ephemeral=True)
-
-    @alliance.command(name="list", description="List this server's alliances.")
-    async def alliance_list(self, interaction: discord.Interaction):
-        alliances = await database.all_alliances(interaction.guild.id)
-        if not alliances:
-            await interaction.response.send_message("No alliances yet.", ephemeral=True)
-            return
-        lines = []
-        for a in alliances:
-            role = interaction.guild.get_role(a["member_role_id"])
-            leader = interaction.guild.get_role(a["leader_role_id"])
-            lines.append(f"**{a['tag']}** — {a['name']}  ·  "
-                         f"{role.mention if role else '(role?)'} / "
-                         f"{leader.mention if leader else '(leader?)'}")
-        embed = discord.Embed(title="Alliances", description="\n".join(lines), color=discord.Color.blurple())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # ── staff-only visibility (owner + roles above the bot) ───
-    def _staff_overwrites(self, guild: discord.Guild) -> dict:
-        """View/send for the owner, the bot, and every role positioned ABOVE the
-        bot's top role; hidden from everyone else."""
+    # ── overwrite helpers ─────────────────────────────────────
+    def _staff_overwrites(self, guild: discord.Guild, read_only: bool = False) -> dict:
+        """View for the owner + roles positioned ABOVE the bot's top role; hidden from
+        everyone else. ``read_only`` blocks their sending (bot still posts)."""
         me = guild.me
-        allow = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        staff = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=not read_only,
+            use_application_commands=not read_only,
+        )
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            me: allow,
+            me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
         }
         if guild.owner:
-            overwrites[guild.owner] = allow
+            overwrites[guild.owner] = staff
         bot_position = me.top_role.position
         for role in guild.roles:
             if role.is_default() or role == me.top_role:
                 continue
             if role.position > bot_position:
-                overwrites[role] = allow
+                overwrites[role] = staff
         return overwrites
 
-    async def _apply_award_channel_perms(self, guild: discord.Guild):
-        """Make the award channel visible to owner + bot + every alliance leader role."""
-        config = await database.get_config(guild.id) or {}
-        cid = config.get("points_admin_channel_id")
-        channel = guild.get_channel(int(cid)) if cid else None
-        if not channel:
-            return
+    def _tool_overwrites(self, guild: discord.Guild, verified: discord.Role, commands_only: bool) -> dict:
+        """Verified can view but not chat. Buttons always work (component interactions
+        aren't gated); slash commands work only when ``commands_only`` is True."""
         me = guild.me
-        allow = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-        overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False), me: allow}
-        if guild.owner:
-            overwrites[guild.owner] = allow
-        for a in await database.all_alliances(guild.id):
-            role = guild.get_role(a["leader_role_id"])
-            if role:
-                overwrites[role] = allow
-        try:
-            await channel.edit(overwrites=overwrites, reason="Kingshot award channel visibility")
-        except discord.HTTPException:
-            pass
+        return {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            verified: discord.PermissionOverwrite(
+                view_channel=True, send_messages=False,
+                use_application_commands=commands_only, add_reactions=False,
+            ),
+            me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
 
     # ── setup channel + control panel ─────────────────────────
     async def ensure_setup_channel(self, guild: discord.Guild) -> discord.TextChannel:
-        """Create (or reuse) the staff-only bot-setup channel and its control panel."""
         config = await database.get_config(guild.id) or {}
         overwrites = self._staff_overwrites(guild)
 
@@ -367,7 +238,6 @@ class SetupCog(commands.Cog, name="Setup"):
         if config.get("setup_channel_id"):
             channel = guild.get_channel(int(config["setup_channel_id"]))
         if isinstance(channel, discord.TextChannel):
-            # Re-apply visibility so a stale/older channel gets corrected.
             try:
                 await channel.edit(overwrites=overwrites, reason="Kingshot setup room visibility")
             except discord.HTTPException:
@@ -383,7 +253,6 @@ class SetupCog(commands.Cog, name="Setup"):
 
     # ── member-list / database channel ────────────────────────
     async def refresh_member_list(self, guild: discord.Guild):
-        """Post/refresh the roster (verified + unverified, by role) in the staff channel."""
         config = await database.get_config(guild.id) or {}
         cid = config.get("member_list_channel_id")
         channel = guild.get_channel(int(cid)) if cid else None
@@ -405,8 +274,9 @@ class SetupCog(commands.Cog, name="Setup"):
             if verified_role and verified_role in m.roles:
                 p = players.get(str(m.id))
                 if p:
+                    name = p["ingame_name"] or "⏳ pending"
                     verified_lines.append(
-                        f"✅ `{p['ingame_id']}` **{p['ingame_name']}** · K{p['kingdom']} · {p['alliance'] or '—'}"
+                        f"✅ `{p['ingame_id']}` **{name}** · K{p['kingdom']} · {p['alliance'] or '—'}"
                     )
                 else:
                     verified_lines.append(f"✅ {m.display_name}")
@@ -461,8 +331,7 @@ class SetupCog(commands.Cog, name="Setup"):
             description=(
                 "Only you (the owner/admins) can see this.\n\n"
                 "**Setup / Re-Setup** — wipe the bot's roles & channels and rebuild everything "
-                "(your player records are kept).\n"
-                "**Add / Remove Alliance** — manage alliances any time.\n\n"
+                "(your player records are kept).\n\n"
                 "Run **Setup** to get started."
             ),
         )
@@ -483,8 +352,7 @@ class SetupCog(commands.Cog, name="Setup"):
                 pass
 
     # ── core provisioning ─────────────────────────────────────
-    async def run_provision(self, interaction, kingdom,
-                            wipe=True, reapply_backfill=True, alliance_tags=None):
+    async def run_provision(self, interaction, kingdom, level=0, wipe=True, reapply_backfill=True):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
 
@@ -504,7 +372,7 @@ class SetupCog(commands.Cog, name="Setup"):
             guild, config.get("verified_role_id"), VERIFIED_ROLE_NAME, color=discord.Color.green()
         )
 
-        # 2. Bot Center channels (verify / welcome / info / log / member-list).
+        # 2. Bot Center channels (verify / info / log / welcome / member-list).
         category = await self._ensure_category(guild, config.get("category_id"))
         verify_channel = await self._ensure_text_channel(
             guild, config.get("verify_channel_id"), VERIFY_CHANNEL_NAME, category,
@@ -516,12 +384,13 @@ class SetupCog(commands.Cog, name="Setup"):
         )
         info_channel = await self._ensure_text_channel(
             guild, config.get("info_channel_id"), INFO_CHANNEL_NAME, category,
-            overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False),
+            overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False,
+                                                                        use_application_commands=False),
                         unverified: hidden, me: bot_allow},
         )
         log_channel = await self._ensure_text_channel(
             guild, config.get("log_channel_id"), LOG_CHANNEL_NAME, category,
-            overwrites={guild.default_role: hidden, me: bot_allow},
+            overwrites=self._staff_overwrites(guild, read_only=True),
         )
         welcome_channel = await self._ensure_text_channel(
             guild, config.get("welcome_channel_id"), WELCOME_CHANNEL_NAME, category,
@@ -530,22 +399,14 @@ class SetupCog(commands.Cog, name="Setup"):
         )
         member_list_channel = await self._ensure_text_channel(
             guild, config.get("member_list_channel_id"), MEMBER_LIST_CHANNEL_NAME, category,
-            overwrites=self._staff_overwrites(guild),
-        )
-        # Leaders-only award channel (owner + admins + alliance leader roles).
-        # Created with a base overwrite here; leader roles are added once the
-        # alliances exist (see _apply_award_channel_perms below).
-        award_ow = {guild.default_role: hidden, me: bot_allow}
-        if guild.owner:
-            award_ow[guild.owner] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-        award_channel = await self._ensure_text_channel(
-            guild, config.get("points_admin_channel_id"), AWARD_CHANNEL_NAME, category, overwrites=award_ow,
+            overwrites=self._staff_overwrites(guild, read_only=True),
         )
 
-        # 3. Community section (OUTSIDE the bot category) + War group.
+        # 3. Community + War + Bot Tools sections.
         community = await self._provision_community(guild, verified, config)
         general_channel = community["general"]
         war = await self._provision_war(guild, verified, config)
+        tools = await self._provision_tools(guild, verified, config)
 
         # 4. Persist config.
         await database.upsert_config(
@@ -554,15 +415,19 @@ class SetupCog(commands.Cog, name="Setup"):
             category_id=category.id, verify_channel_id=verify_channel.id,
             info_channel_id=info_channel.id, log_channel_id=log_channel.id,
             welcome_channel_id=welcome_channel.id, member_list_channel_id=member_list_channel.id,
-            points_admin_channel_id=award_channel.id,
             community_category_id=community["category"].id, general_channel_id=general_channel.id,
+            giftcode_channel_id=community["giftcodes"].id,
             memes_channel_id=community["memes"].id, gifs_channel_id=community["gifs"].id,
-            lobby_voice_id=community["lobby"].id, points_board_channel_id=community["leaderboard"].id,
+            lobby_voice_id=community["lobby"].id,
             war_category_id=war["category"].id, war_strategy_id=war["strategy"].id,
             war_voice_id=war["voice"].id, rally_leaders_channel_id=war["rally_leaders"].id,
             rally_joiners_channel_id=war["rally_joiners"].id,
             rally_leader_role_id=war["leader_role"].id, rally_joiner_role_id=war["joiner_role"].id,
-            allowed_kingdom=kingdom, lockdown_existing=1,
+            tools_category_id=tools["category"].id,
+            scout_channel_id=tools["scout"].id, locate_channel_id=tools["locate"].id,
+            selfstats_channel_id=tools["selfstats"].id, kingdom_channel_id=tools["kingdom"].id,
+            compare_channel_id=tools["compare"].id, commands_channel_id=tools["commands"].id,
+            allowed_kingdom=kingdom, allowed_level=level, lockdown_existing=1,
         )
 
         # 5. Lockdown: Unverified sees only verify + welcome.
@@ -570,26 +435,27 @@ class SetupCog(commands.Cog, name="Setup"):
             guild, unverified, allowed_channel_ids={verify_channel.id, welcome_channel.id}
         )
 
-        # 6. Verify button.
-        await self._post_verify_message(guild, verify_channel, kingdom, 0)
+        # 6. Verify button + bot-info help.
+        await self._post_verify_message(guild, verify_channel, kingdom, level)
+        await self._post_info_help(guild, info_channel)
 
-        # 7. Alliances entered in the setup pop-up.
-        created_tags = []
-        for tag in (alliance_tags or []):
-            try:
-                await self.provision_alliance(guild, tag, None)
-                created_tags.append(tag)
-            except discord.HTTPException:
-                logging.warning("Could not create alliance %s in %s", tag, guild.id)
+        # 7. Post every tool panel + tell moderation which channel is gifs-only.
+        scout_cog = self.bot.get_cog("Scout")
+        if scout_cog:
+            await scout_cog.ensure_panel(guild)
+        intel_cog = self.bot.get_cog("Intel")
+        if intel_cog:
+            await intel_cog.ensure_panels(guild)
+        mod_cog = self.bot.get_cog("Moderation")
+        if mod_cog:
+            mod_cog.note_gifs_channel(guild.id, community["gifs"].id)
+        roster_cog = self.bot.get_cog("Roster")
+        if roster_cog:
+            await roster_cog.ensure_manage_panel(guild)
+
         await self.refresh_member_list(guild)
-        await self._apply_award_channel_perms(guild)
-        points_cog = self.bot.get_cog("Points")
-        if points_cog:
-            await points_cog.ensure_panel(guild)
-            await points_cog.refresh_leaderboard(guild)
 
-        # 8. Re-gate existing members: everyone without the Verified role gets the
-        #    Unverified role so they can (re-)verify. Skipped on /resync.
+        # 8. Re-gate existing members so they can (re-)verify. Skipped on /resync.
         backfilled = 0
         if reapply_backfill:
             backfilled = await self._backfill_members(guild, unverified, verified)
@@ -599,24 +465,23 @@ class SetupCog(commands.Cog, name="Setup"):
             title="✅ Setup complete", color=discord.Color.green(),
             description=(
                 f"**Verify:** {verify_channel.mention}  •  **Welcome:** {welcome_channel.mention}\n"
-                f"**Community:** {general_channel.mention}, {community['memes'].mention}, "
-                f"{community['gifs'].mention}, {community['leaderboard'].mention}, 🔊 {community['lobby'].name}\n"
-                f"**Staff:** {member_list_channel.mention}, {award_channel.mention}, "
-                f"{log_channel.mention}, {info_channel.mention}\n"
+                f"**Community:** {general_channel.mention}, {community['giftcodes'].mention}, "
+                f"{community['memes'].mention}, {community['gifs'].mention}, 🔊 {community['lobby'].name}\n"
+                f"**Staff:** {member_list_channel.mention}, {log_channel.mention}, {info_channel.mention}\n"
                 f"**War:** {war['strategy'].mention}, {war['rally_leaders'].mention}, "
                 f"{war['rally_joiners'].mention}, 🔊 {war['voice'].name}\n"
-                f"**Allowed kingdom:** {kingdom}\n"
-                + (f"**Alliances created:** {', '.join(created_tags)}\n" if created_tags else
-                   "**Alliances:** none yet — use **Add Alliance** on the panel.\n")
+                f"**Bot Tools:** {tools['scout'].mention}, {tools['locate'].mention}, "
+                f"{tools['selfstats'].mention}, {tools['kingdom'].mention}, "
+                f"{tools['compare'].mention}, {tools['commands'].mention}\n"
+                f"**Allowed kingdom:** {kingdom}"
+                + (f"  •  **Min TC level:** {level}" if level else "") + "\n"
                 + f"**Channels locked for Unverified:** {swept}"
                 + (f" (skipped {skipped})" if skipped else "")
                 + (f"\n**Existing members set to Unverified:** {backfilled}" if reapply_backfill else "")
             ),
         )
-        # Setup messages are temporary — post to the setup channel, self-delete in 15s.
-        target = interaction.channel
         try:
-            await target.send(embed=summary, delete_after=SETUP_MSG_TTL)
+            await interaction.channel.send(embed=summary, delete_after=SETUP_MSG_TTL)
         except discord.HTTPException:
             pass
         await interaction.followup.send(
@@ -636,18 +501,19 @@ class SetupCog(commands.Cog, name="Setup"):
         if not isinstance(category, discord.CategoryChannel):
             category = await guild.create_category(COMMUNITY_CATEGORY_NAME, overwrites=overwrites, reason="Kingshot community")
         general = await self._ensure_text_channel(guild, config.get("general_channel_id"), GENERAL_CHANNEL_NAME, category, overwrites)
-        memes = await self._ensure_text_channel(guild, config.get("memes_channel_id"), MEMES_CHANNEL_NAME, category, overwrites)
-        gifs = await self._ensure_text_channel(guild, config.get("gifs_channel_id"), GIFS_CHANNEL_NAME, category, overwrites)
-        # Leaderboard channel: members can read, only the bot posts.
-        board_overwrites = {
+        # Gift codes: everyone verified can read, only the bot posts (read-only).
+        readonly = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            verified: discord.PermissionOverwrite(view_channel=True, send_messages=False),
+            verified: discord.PermissionOverwrite(view_channel=True, send_messages=False,
+                                                  use_application_commands=False, add_reactions=True),
             me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
         }
-        leaderboard = await self._ensure_text_channel(guild, config.get("points_board_channel_id"), LEADERBOARD_CHANNEL_NAME, category, board_overwrites)
+        giftcodes = await self._ensure_text_channel(guild, config.get("giftcode_channel_id"), GIFTCODE_CHANNEL_NAME, category, readonly)
+        memes = await self._ensure_text_channel(guild, config.get("memes_channel_id"), MEMES_CHANNEL_NAME, category, overwrites)
+        gifs = await self._ensure_text_channel(guild, config.get("gifs_channel_id"), GIFS_CHANNEL_NAME, category, overwrites)
         lobby = await self._ensure_voice_channel(guild, config.get("lobby_voice_id"), LOBBY_VOICE_NAME, category, overwrites)
-        return {"category": category, "general": general, "memes": memes, "gifs": gifs,
-                "lobby": lobby, "leaderboard": leaderboard}
+        return {"category": category, "general": general, "giftcodes": giftcodes,
+                "memes": memes, "gifs": gifs, "lobby": lobby}
 
     async def _provision_war(self, guild, verified, config) -> dict:
         me = guild.me
@@ -673,20 +539,48 @@ class SetupCog(commands.Cog, name="Setup"):
                 "rally_leaders": rally_leaders, "rally_joiners": rally_joiners,
                 "leader_role": leader_role, "joiner_role": joiner_role}
 
+    async def _provision_tools(self, guild, verified, config) -> dict:
+        """Button-first tool pages. Five are buttons-only; bot-commands allows commands."""
+        me = guild.me
+        cat_overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            verified: discord.PermissionOverwrite(view_channel=True),
+            me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        category = config.get("tools_category_id") and guild.get_channel(int(config["tools_category_id"]))
+        if not isinstance(category, discord.CategoryChannel):
+            category = await guild.create_category(TOOLS_CATEGORY_NAME, overwrites=cat_overwrites, reason="Kingshot bot tools")
+
+        buttons_only = self._tool_overwrites(guild, verified, commands_only=False)
+        commands_only = self._tool_overwrites(guild, verified, commands_only=True)
+        scout = await self._ensure_text_channel(guild, config.get("scout_channel_id"), SCOUT_CHANNEL_NAME, category, buttons_only)
+        locate = await self._ensure_text_channel(guild, config.get("locate_channel_id"), LOCATE_CHANNEL_NAME, category, buttons_only)
+        selfstats = await self._ensure_text_channel(guild, config.get("selfstats_channel_id"), SELFSTATS_CHANNEL_NAME, category, buttons_only)
+        kingdom = await self._ensure_text_channel(guild, config.get("kingdom_channel_id"), KINGDOM_CHANNEL_NAME, category, buttons_only)
+        compare = await self._ensure_text_channel(guild, config.get("compare_channel_id"), COMPARE_CHANNEL_NAME, category, buttons_only)
+        commands = await self._ensure_text_channel(guild, config.get("commands_channel_id"), COMMANDS_CHANNEL_NAME, category, commands_only)
+        return {"category": category, "scout": scout, "locate": locate, "selfstats": selfstats,
+                "kingdom": kingdom, "compare": compare, "commands": commands}
+
     # ── wipe ──────────────────────────────────────────────────
     async def wipe_bot_artifacts(self, guild: discord.Guild):
         """Delete every bot-created role/channel (except the setup channel). Keeps players."""
         config = await database.get_config(guild.id) or {}
 
+        # Ceremonial alliance roles (from the API) — delete the role, no channels.
         for a in await database.all_alliances(guild.id):
             await self.remove_alliance(guild, a["tag"])
 
         channel_keys = (
             "verify_channel_id", "info_channel_id", "log_channel_id", "welcome_channel_id",
-            "member_list_channel_id", "points_admin_channel_id", "general_channel_id",
-            "memes_channel_id", "gifs_channel_id", "lobby_voice_id", "points_board_channel_id",
-            "community_category_id", "war_strategy_id", "war_voice_id",
-            "rally_leaders_channel_id", "rally_joiners_channel_id", "war_category_id", "category_id",
+            "member_list_channel_id", "general_channel_id", "giftcode_channel_id",
+            "memes_channel_id", "gifs_channel_id", "lobby_voice_id", "community_category_id",
+            "war_strategy_id", "war_voice_id", "rally_leaders_channel_id", "rally_joiners_channel_id",
+            "war_category_id", "category_id",
+            "scout_channel_id", "locate_channel_id", "selfstats_channel_id", "kingdom_channel_id",
+            "compare_channel_id", "commands_channel_id", "tools_category_id",
+            # legacy (pre-phase-4) points channels — clean up if present on older servers.
+            "points_admin_channel_id", "points_board_channel_id",
         )
         for key in channel_keys:
             cid = config.get(key)
@@ -712,15 +606,46 @@ class SetupCog(commands.Cog, name="Setup"):
             guild.id,
             unverified_role_id=None, verified_role_id=None, category_id=None,
             verify_channel_id=None, info_channel_id=None, log_channel_id=None,
-            welcome_channel_id=None, verify_message_id=None, general_channel_id=None,
-            member_list_channel_id=None, member_list_message_id=None,
+            welcome_channel_id=None, verify_message_id=None, info_message_id=None,
+            general_channel_id=None, giftcode_channel_id=None,
+            member_list_channel_id=None, member_list_message_id=None, manage_panel_message_id=None,
             community_category_id=None, memes_channel_id=None, gifs_channel_id=None, lobby_voice_id=None,
-            points_board_channel_id=None, points_board_message_id=None,
-            points_admin_channel_id=None, points_panel_message_id=None,
             war_category_id=None, war_strategy_id=None, war_voice_id=None,
             rally_leaders_channel_id=None, rally_joiners_channel_id=None,
             rally_leader_role_id=None, rally_joiner_role_id=None,
+            tools_category_id=None,
+            scout_channel_id=None, scout_panel_message_id=None,
+            locate_channel_id=None, locate_panel_message_id=None,
+            selfstats_channel_id=None, selfstats_panel_message_id=None,
+            kingdom_channel_id=None, kingdom_panel_message_id=None,
+            compare_channel_id=None, compare_panel_message_id=None,
+            commands_channel_id=None, commands_panel_message_id=None,
         )
+
+    async def remove_alliance(self, guild, tag: str) -> bool:
+        """Delete a ceremonial alliance's role (and any legacy channels, if present)."""
+        tag = tag.upper()
+        alliance = await database.get_alliance(guild.id, tag)
+        if not alliance:
+            return False
+        for key in ("chat_channel_id", "leaders_channel_id", "voice_channel_id", "category_id"):
+            cid = alliance.get(key)
+            chan = guild.get_channel(int(cid)) if cid else None
+            if chan:
+                try:
+                    await chan.delete(reason="Kingshot alliance removed")
+                except discord.HTTPException:
+                    pass
+        for key in ("member_role_id", "leader_role_id"):
+            rid = alliance.get(key)
+            role = guild.get_role(int(rid)) if rid else None
+            if role:
+                try:
+                    await role.delete(reason="Kingshot alliance removed")
+                except discord.HTTPException:
+                    pass
+        await database.delete_alliance(guild.id, tag)
+        return True
 
     # ── generic ensure helpers ────────────────────────────────
     async def _ensure_role(self, guild, role_id, name, **kwargs) -> discord.Role:
@@ -768,65 +693,6 @@ class SetupCog(commands.Cog, name="Setup"):
                 logging.warning("Lockdown overwrite failed on %s: %s", channel, e)
         return swept, skipped
 
-    # ── alliance provisioning ─────────────────────────────────
-    async def provision_alliance(self, guild, tag: str, name: str | None):
-        tag = tag.upper()
-        name = (name or tag).strip()
-        existing = await database.get_alliance(guild.id, tag) or {}
-
-        member_role = await self._ensure_role(guild, existing.get("member_role_id"), tag)
-        leader_role = await self._ensure_role(
-            guild, existing.get("leader_role_id"), f"{tag} {LEADER_ROLE_SUFFIX}", color=discord.Color.gold()
-        )
-        me = guild.me
-        base_overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            member_role: discord.PermissionOverwrite(view_channel=True),
-            leader_role: discord.PermissionOverwrite(view_channel=True),
-            me: discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True),
-        }
-        category = existing.get("category_id") and guild.get_channel(int(existing["category_id"]))
-        if not isinstance(category, discord.CategoryChannel):
-            category = await guild.create_category(tag, overwrites=base_overwrites, reason="Kingshot alliance setup")
-
-        chat = await self._ensure_text_channel(guild, existing.get("chat_channel_id"), f"{tag}-chat", category, base_overwrites)
-        leaders_overwrites = dict(base_overwrites)
-        leaders_overwrites[member_role] = discord.PermissionOverwrite(view_channel=False)
-        leaders = await self._ensure_text_channel(guild, existing.get("leaders_channel_id"), f"{tag}-leaders", category, leaders_overwrites)
-        voice = await self._ensure_voice_channel(guild, existing.get("voice_channel_id"), f"{tag} Voice", category, base_overwrites)
-
-        await database.add_alliance(
-            guild.id, tag, name,
-            member_role_id=member_role.id, leader_role_id=leader_role.id, category_id=category.id,
-            chat_channel_id=chat.id, leaders_channel_id=leaders.id, voice_channel_id=voice.id,
-        )
-        await self._apply_award_channel_perms(guild)  # let the new leader role see #award-points
-        return await database.get_alliance(guild.id, tag)
-
-    async def remove_alliance(self, guild, tag: str) -> bool:
-        tag = tag.upper()
-        alliance = await database.get_alliance(guild.id, tag)
-        if not alliance:
-            return False
-        for cid in (alliance["chat_channel_id"], alliance["leaders_channel_id"],
-                    alliance["voice_channel_id"], alliance["category_id"]):
-            chan = guild.get_channel(int(cid)) if cid else None
-            if chan:
-                try:
-                    await chan.delete(reason="Kingshot alliance removed")
-                except discord.HTTPException:
-                    pass
-        for rid in (alliance["member_role_id"], alliance["leader_role_id"]):
-            role = guild.get_role(int(rid)) if rid else None
-            if role:
-                try:
-                    await role.delete(reason="Kingshot alliance removed")
-                except discord.HTTPException:
-                    pass
-        await database.delete_alliance(guild.id, tag)
-        await self._apply_award_channel_perms(guild)
-        return True
-
     async def _post_verify_message(self, guild, verify_channel, kingdom, level):
         config = await database.get_config(guild.id) or {}
         msg_id = config.get("verify_message_id")
@@ -839,14 +705,60 @@ class SetupCog(commands.Cog, name="Setup"):
         embed = discord.Embed(
             title="🔒 Verify to unlock the server", color=discord.Color.blurple(),
             description=(
-                "Click **Verify** below and enter your Kingshot details.\n\n"
-                "**You'll need:** your **in-game ID**, **in-game name**, **kingdom**, and **alliance**.\n\n"
-                f"**This server accepts kingdom {kingdom}.**\n\n"
-                "Already verified and want to change your details? Use **Reverify**."
+                "Click **Verify** below and enter just your **in-game ID** — I'll pull your name, "
+                "kingdom, and alliance from the game automatically.\n\n"
+                f"**Requirements:** kingdom **{kingdom}**"
+                + (f", Town Center **{level}+**" if level else "") + ".\n\n"
+                "Already verified and want to refresh your stats? Use **Reverify**."
             ),
         )
         message = await verify_channel.send(embed=embed, view=VerifyView())
         await database.upsert_config(guild.id, verify_message_id=message.id)
+
+    async def _post_info_help(self, guild, info_channel):
+        config = await database.get_config(guild.id) or {}
+        msg_id = config.get("info_message_id")
+        if msg_id:
+            try:
+                await info_channel.fetch_message(int(msg_id))
+                return
+            except (discord.NotFound, discord.HTTPException):
+                pass
+        embed = discord.Embed(
+            title="🤖 About this bot — how everything works",
+            color=discord.Color.blurple(),
+            description=(
+                "Welcome! This bot runs the server and gives everyone live Kingshot intel. "
+                "Almost everything is done with **buttons** — you rarely need to type a command."
+            ),
+        )
+        embed.add_field(
+            name="✅ Getting verified",
+            value=("Go to the verify channel and tap **Verify**, then enter your **in-game ID** "
+                   "(Profile → the number under your name). I confirm your kingdom, set your "
+                   "nickname, and unlock the rest of the server. Tap **Reverify** any time to "
+                   "refresh your details."),
+            inline=False,
+        )
+        embed.add_field(
+            name="🛰️ Bot Tools (click the buttons)",
+            value=("🎯 **Scout Opponents** — see any enemy alliance's top players, heroes & gear.\n"
+                   "📍 **Locate a Player** — kingdom, map coordinates, alliance, activity.\n"
+                   "🪞 **My Stats** — your own detailed profile with power, ranks, heroes.\n"
+                   "🏰 **Kingdom Knowledge** — a kingdom's battle stats and its top 10 players.\n"
+                   "⚖️ **Compare Players** — two players side by side."),
+            inline=False,
+        )
+        embed.add_field(
+            name="🎁 Gift codes & 🗣️ community",
+            value=("New gift codes are announced automatically in the gift-codes channel. Chat in general/memes, "
+                   "share clips in the gifs channel (**GIFs only there**), and hop into the Lobby "
+                   "or War voice channels to coordinate."),
+            inline=False,
+        )
+        embed.set_footer(text="Questions? Ping an admin.")
+        message = await info_channel.send(embed=embed)
+        await database.upsert_config(guild.id, info_message_id=message.id)
 
     async def _backfill_members(self, guild, unverified, verified) -> int:
         if not guild.chunked:
@@ -871,9 +783,9 @@ class SetupCog(commands.Cog, name="Setup"):
     @commands.Cog.listener()
     async def on_guild_join(self, guild: discord.Guild):
         try:
-            channel = await self.ensure_setup_channel(guild)
+            await self.ensure_setup_channel(guild)
         except discord.HTTPException:
-            channel = None
+            pass
         note = discord.Embed(
             title="Thanks for adding the Kingshot bot!",
             color=discord.Color.blurple(),
@@ -890,7 +802,6 @@ class SetupCog(commands.Cog, name="Setup"):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        # Backfill the setup channel for guilds the bot was already in.
         for guild in list(self.bot.guilds):
             try:
                 await self.ensure_setup_channel(guild)

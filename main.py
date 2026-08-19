@@ -14,10 +14,15 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+import database
 import kingshot_api
 from views.verify_view import VerifyView
 from cogs.setup_cog import SetupPanelView
-from cogs.points import PointsPanelView
+from cogs.scout import ScoutPanelView
+from cogs.intel import (
+    LocatePanelView, SelfPanelView, KingdomPanelView, ComparePanelView, CommandsPanelView,
+)
+from cogs.roster import ManagePanelView
 
 # ─────────────────────────────────────────────
 # ENVIRONMENT & LOGGING
@@ -37,7 +42,8 @@ INITIAL_EXTENSIONS = [
     "cogs.tracker",
     "cogs.moderation",
     "cogs.giftcode",
-    "cogs.points",
+    "cogs.scout",
+    "cogs.intel",
 ]
 
 # ─────────────────────────────────────────────
@@ -53,6 +59,10 @@ class KingshotBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
+        # Connect to Postgres and ensure the schema before anything else.
+        await database.init_pool()
+        logging.info("Database pool ready.")
+
         # Load every feature cog.
         for ext in INITIAL_EXTENSIONS:
             await self.load_extension(ext)
@@ -60,7 +70,13 @@ class KingshotBot(commands.Bot):
         # Register persistent views so their buttons work after restarts.
         self.add_view(VerifyView())
         self.add_view(SetupPanelView())
-        self.add_view(PointsPanelView())
+        self.add_view(ScoutPanelView())
+        self.add_view(LocatePanelView())
+        self.add_view(SelfPanelView())
+        self.add_view(KingdomPanelView())
+        self.add_view(ComparePanelView())
+        self.add_view(CommandsPanelView())
+        self.add_view(ManagePanelView())
 
         # Sync application (slash) commands. Don't let a sync failure crash startup.
         try:
@@ -86,8 +102,9 @@ class KingshotBot(commands.Bot):
         print(f"Logged in as {self.user} (id: {self.user.id})")
 
     async def close(self):
-        # Clean up the shared Kingshot API session on shutdown.
+        # Clean up the shared Kingshot API session + DB pool on shutdown.
         await kingshot_api.close()
+        await database.close_pool()
         await super().close()
 
 

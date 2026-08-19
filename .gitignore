@@ -1,6 +1,29 @@
+# ── Secrets / environment ─────────────────────────────
 .env
-discord.log
-kingshot.db
+.env.*
+!.env.example
+
+# ── Local data & logs ─────────────────────────────────
 data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# ── Python ────────────────────────────────────────────
 __pycache__/
+*.py[cod]
+*.egg-info/
 .venv/
+venv/
+env/
+
+# ── Editor / OS ───────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── Dev scratch (never ship) ──────────────────────────
+test_redeem*.py
+scratch_*.py
