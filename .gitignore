@@ -1,4 +1,6 @@
 .env
 discord.log
 kingshot.db
+data/
 __pycache__/
+.venv/
