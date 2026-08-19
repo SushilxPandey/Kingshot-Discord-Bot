@@ -71,6 +71,10 @@ def _ensure_schema(guild_id: int | str) -> None:
                 memes_channel_id   INTEGER,
                 gifs_channel_id    INTEGER,
                 lobby_voice_id     INTEGER,
+                points_board_channel_id INTEGER,
+                points_board_message_id INTEGER,
+                points_admin_channel_id INTEGER,
+                points_panel_message_id INTEGER,
                 war_category_id    INTEGER,
                 war_strategy_id    INTEGER,
                 war_voice_id       INTEGER,
@@ -106,6 +110,22 @@ def _ensure_schema(guild_id: int | str) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS points (
+                discord_id TEXT PRIMARY KEY,
+                points     INTEGER DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS announced_codes (
+                code       TEXT PRIMARY KEY,
+                created_at TEXT
+            )
+            """
+        )
         _migrate(conn)
         conn.commit()
     finally:
@@ -126,6 +146,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "memes_channel_id",
         "gifs_channel_id",
         "lobby_voice_id",
+        "points_board_channel_id",
+        "points_board_message_id",
+        "points_admin_channel_id",
+        "points_panel_message_id",
         "war_category_id",
         "war_strategy_id",
         "war_voice_id",
@@ -312,6 +336,10 @@ _CONFIG_FIELDS = (
     "memes_channel_id",
     "gifs_channel_id",
     "lobby_voice_id",
+    "points_board_channel_id",
+    "points_board_message_id",
+    "points_admin_channel_id",
+    "points_panel_message_id",
     "war_category_id",
     "war_strategy_id",
     "war_voice_id",
@@ -531,3 +559,109 @@ def _reset_warning(guild_id, discord_id) -> None:
 async def reset_warning(guild_id, discord_id) -> None:
     """Clear a member's strikes (after escalation, or an admin reset)."""
     await asyncio.to_thread(_reset_warning, guild_id, discord_id)
+
+
+# ──────────────────────────────────────────────────────────────
+# Public async API — contribution points
+# ──────────────────────────────────────────────────────────────
+def _award_points(guild_id, discord_id, delta) -> int:
+    _ensure_schema(guild_id)
+    conn = _connect(guild_id)
+    try:
+        conn.execute("INSERT OR IGNORE INTO points (discord_id, points) VALUES (?, 0)", (str(discord_id),))
+        conn.execute(
+            "UPDATE points SET points = MAX(0, points + ?) WHERE discord_id = ?",
+            (int(delta), str(discord_id)),
+        )
+        conn.commit()
+        row = conn.execute("SELECT points FROM points WHERE discord_id = ?", (str(discord_id),)).fetchone()
+        return int(row["points"]) if row else 0
+    finally:
+        conn.close()
+
+
+async def award_points(guild_id, discord_id, delta) -> int:
+    """Add (or subtract, if delta<0) points; total is clamped at 0. Returns new total."""
+    return await asyncio.to_thread(_award_points, guild_id, discord_id, delta)
+
+
+def _get_points(guild_id, discord_id) -> int:
+    _ensure_schema(guild_id)
+    conn = _connect(guild_id)
+    try:
+        row = conn.execute("SELECT points FROM points WHERE discord_id = ?", (str(discord_id),)).fetchone()
+        return int(row["points"]) if row else 0
+    finally:
+        conn.close()
+
+
+async def get_points(guild_id, discord_id) -> int:
+    return await asyncio.to_thread(_get_points, guild_id, discord_id)
+
+
+def _all_points(guild_id) -> list[dict]:
+    _ensure_schema(guild_id)
+    conn = _connect(guild_id)
+    try:
+        rows = conn.execute(
+            "SELECT discord_id, points FROM points WHERE points > 0 ORDER BY points DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def all_points(guild_id) -> list[dict]:
+    """All members with a positive points total, highest first."""
+    return await asyncio.to_thread(_all_points, guild_id)
+
+
+# ──────────────────────────────────────────────────────────────
+# Public async API — announced gift codes (auto-announce dedupe)
+# ──────────────────────────────────────────────────────────────
+def _mark_code_announced(guild_id, code, created_at) -> bool:
+    """Returns True if this is a NEW code (inserted), False if already announced."""
+    _ensure_schema(guild_id)
+    conn = _connect(guild_id)
+    try:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO announced_codes (code, created_at) VALUES (?, ?)",
+            (str(code), created_at),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+async def mark_code_announced(guild_id, code, created_at=None) -> bool:
+    return await asyncio.to_thread(_mark_code_announced, guild_id, code, created_at)
+
+
+def _code_already_announced(guild_id, code) -> bool:
+    _ensure_schema(guild_id)
+    conn = _connect(guild_id)
+    try:
+        row = conn.execute("SELECT 1 FROM announced_codes WHERE code = ?", (str(code),)).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+async def code_already_announced(guild_id, code) -> bool:
+    return await asyncio.to_thread(_code_already_announced, guild_id, code)
+
+
+def _announced_count(guild_id) -> int:
+    _ensure_schema(guild_id)
+    conn = _connect(guild_id)
+    try:
+        row = conn.execute("SELECT COUNT(*) AS n FROM announced_codes").fetchone()
+        return int(row["n"]) if row else 0
+    finally:
+        conn.close()
+
+
+async def announced_count(guild_id) -> int:
+    """How many codes we've recorded — 0 means this guild has never polled."""
+    return await asyncio.to_thread(_announced_count, guild_id)

@@ -13,16 +13,23 @@ import logging
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import database
+import kingshot_api
 
 REDEEM_URL = "https://ks-giftcode.centurygame.com/"
+POLL_HOURS = 2   # how often to check for new active codes
 
 
 class GiftCode(commands.Cog, name="GiftCode"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.check_codes.start()
+
+    def cog_unload(self):
+        if self.check_codes.is_running():
+            self.check_codes.cancel()
 
     def _led_alliances(self, member: discord.Member, alliances: list[dict]) -> list[dict]:
         role_ids = {r.id for r in member.roles}
@@ -105,6 +112,53 @@ class GiftCode(commands.Cog, name="GiftCode"):
                     )
                 except discord.HTTPException:
                     pass
+
+
+    # ── auto-announce new codes (the LIST endpoint is live) ───
+    @tasks.loop(hours=POLL_HOURS)
+    async def check_codes(self):
+        codes = await kingshot_api.get_active_codes()
+        if not codes:
+            return
+        for guild_id in await database.list_guild_ids():
+            guild = self.bot.get_guild(int(guild_id))
+            if guild is None:
+                continue
+            config = await database.get_config(guild_id)
+            if not config:
+                continue
+            general = guild.get_channel(int(config["general_channel_id"])) if config.get("general_channel_id") else None
+            verified_role = guild.get_role(config["verified_role_id"]) if config.get("verified_role_id") else None
+            # First poll for this guild: seed silently so we don't dump the backlog.
+            seed = await database.announced_count(guild_id) == 0
+            for c in codes:
+                code = c.get("code")
+                if not code:
+                    continue
+                is_new = await database.mark_code_announced(guild_id, code, c.get("createdAt"))
+                if is_new and not seed and general:
+                    await self._announce_new_code(general, verified_role, code)
+
+    @check_codes.before_loop
+    async def _before(self):
+        await self.bot.wait_until_ready()
+
+    async def _announce_new_code(self, channel, ping_role, code):
+        embed = discord.Embed(
+            title="🎁 New Gift Code available!",
+            color=discord.Color.gold(),
+            description=(
+                f"**Code:** `{code}`\n\n"
+                "Redeem it in-game via **Settings → Gift Code**, or at "
+                f"{REDEEM_URL} with your Player ID.\n\nCodes expire — grab it soon!"
+            ),
+        )
+        content = ping_role.mention if ping_role else None
+        allowed = discord.AllowedMentions(roles=[ping_role] if ping_role else False)
+        try:
+            await channel.send(content=content, embed=embed, allowed_mentions=allowed)
+        except discord.HTTPException:
+            pass
 
 
 async def setup(bot: commands.Bot):

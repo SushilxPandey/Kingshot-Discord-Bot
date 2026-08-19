@@ -32,6 +32,7 @@ LOG_CHANNEL_NAME = "bot-log"
 WELCOME_CHANNEL_NAME = "welcome"
 SETUP_CHANNEL_NAME = "bot-setup"
 MEMBER_LIST_CHANNEL_NAME = "member-list"
+AWARD_CHANNEL_NAME = "award-points"
 UNVERIFIED_ROLE_NAME = "Unverified"
 VERIFIED_ROLE_NAME = "Verified"
 
@@ -41,6 +42,7 @@ GENERAL_CHANNEL_NAME = "general"
 MEMES_CHANNEL_NAME = "memes"
 GIFS_CHANNEL_NAME = "gifs"
 LOBBY_VOICE_NAME = "Lobby"
+LEADERBOARD_CHANNEL_NAME = "leaderboard"
 
 SETUP_MSG_TTL = 15                   # setup status messages self-delete after 15s
 
@@ -334,6 +336,27 @@ class SetupCog(commands.Cog, name="Setup"):
                 overwrites[role] = allow
         return overwrites
 
+    async def _apply_award_channel_perms(self, guild: discord.Guild):
+        """Make the award channel visible to owner + bot + every alliance leader role."""
+        config = await database.get_config(guild.id) or {}
+        cid = config.get("points_admin_channel_id")
+        channel = guild.get_channel(int(cid)) if cid else None
+        if not channel:
+            return
+        me = guild.me
+        allow = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False), me: allow}
+        if guild.owner:
+            overwrites[guild.owner] = allow
+        for a in await database.all_alliances(guild.id):
+            role = guild.get_role(a["leader_role_id"])
+            if role:
+                overwrites[role] = allow
+        try:
+            await channel.edit(overwrites=overwrites, reason="Kingshot award channel visibility")
+        except discord.HTTPException:
+            pass
+
     # ── setup channel + control panel ─────────────────────────
     async def ensure_setup_channel(self, guild: discord.Guild) -> discord.TextChannel:
         """Create (or reuse) the staff-only bot-setup channel and its control panel."""
@@ -509,6 +532,15 @@ class SetupCog(commands.Cog, name="Setup"):
             guild, config.get("member_list_channel_id"), MEMBER_LIST_CHANNEL_NAME, category,
             overwrites=self._staff_overwrites(guild),
         )
+        # Leaders-only award channel (owner + admins + alliance leader roles).
+        # Created with a base overwrite here; leader roles are added once the
+        # alliances exist (see _apply_award_channel_perms below).
+        award_ow = {guild.default_role: hidden, me: bot_allow}
+        if guild.owner:
+            award_ow[guild.owner] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        award_channel = await self._ensure_text_channel(
+            guild, config.get("points_admin_channel_id"), AWARD_CHANNEL_NAME, category, overwrites=award_ow,
+        )
 
         # 3. Community section (OUTSIDE the bot category) + War group.
         community = await self._provision_community(guild, verified, config)
@@ -522,9 +554,10 @@ class SetupCog(commands.Cog, name="Setup"):
             category_id=category.id, verify_channel_id=verify_channel.id,
             info_channel_id=info_channel.id, log_channel_id=log_channel.id,
             welcome_channel_id=welcome_channel.id, member_list_channel_id=member_list_channel.id,
+            points_admin_channel_id=award_channel.id,
             community_category_id=community["category"].id, general_channel_id=general_channel.id,
             memes_channel_id=community["memes"].id, gifs_channel_id=community["gifs"].id,
-            lobby_voice_id=community["lobby"].id,
+            lobby_voice_id=community["lobby"].id, points_board_channel_id=community["leaderboard"].id,
             war_category_id=war["category"].id, war_strategy_id=war["strategy"].id,
             war_voice_id=war["voice"].id, rally_leaders_channel_id=war["rally_leaders"].id,
             rally_joiners_channel_id=war["rally_joiners"].id,
@@ -549,6 +582,11 @@ class SetupCog(commands.Cog, name="Setup"):
             except discord.HTTPException:
                 logging.warning("Could not create alliance %s in %s", tag, guild.id)
         await self.refresh_member_list(guild)
+        await self._apply_award_channel_perms(guild)
+        points_cog = self.bot.get_cog("Points")
+        if points_cog:
+            await points_cog.ensure_panel(guild)
+            await points_cog.refresh_leaderboard(guild)
 
         # 8. Re-gate existing members: everyone without the Verified role gets the
         #    Unverified role so they can (re-)verify. Skipped on /resync.
@@ -562,8 +600,9 @@ class SetupCog(commands.Cog, name="Setup"):
             description=(
                 f"**Verify:** {verify_channel.mention}  •  **Welcome:** {welcome_channel.mention}\n"
                 f"**Community:** {general_channel.mention}, {community['memes'].mention}, "
-                f"{community['gifs'].mention}, 🔊 {community['lobby'].name}\n"
-                f"**Staff:** {member_list_channel.mention}, {log_channel.mention}, {info_channel.mention}\n"
+                f"{community['gifs'].mention}, {community['leaderboard'].mention}, 🔊 {community['lobby'].name}\n"
+                f"**Staff:** {member_list_channel.mention}, {award_channel.mention}, "
+                f"{log_channel.mention}, {info_channel.mention}\n"
                 f"**War:** {war['strategy'].mention}, {war['rally_leaders'].mention}, "
                 f"{war['rally_joiners'].mention}, 🔊 {war['voice'].name}\n"
                 f"**Allowed kingdom:** {kingdom}\n"
@@ -599,8 +638,16 @@ class SetupCog(commands.Cog, name="Setup"):
         general = await self._ensure_text_channel(guild, config.get("general_channel_id"), GENERAL_CHANNEL_NAME, category, overwrites)
         memes = await self._ensure_text_channel(guild, config.get("memes_channel_id"), MEMES_CHANNEL_NAME, category, overwrites)
         gifs = await self._ensure_text_channel(guild, config.get("gifs_channel_id"), GIFS_CHANNEL_NAME, category, overwrites)
+        # Leaderboard channel: members can read, only the bot posts.
+        board_overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            verified: discord.PermissionOverwrite(view_channel=True, send_messages=False),
+            me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        leaderboard = await self._ensure_text_channel(guild, config.get("points_board_channel_id"), LEADERBOARD_CHANNEL_NAME, category, board_overwrites)
         lobby = await self._ensure_voice_channel(guild, config.get("lobby_voice_id"), LOBBY_VOICE_NAME, category, overwrites)
-        return {"category": category, "general": general, "memes": memes, "gifs": gifs, "lobby": lobby}
+        return {"category": category, "general": general, "memes": memes, "gifs": gifs,
+                "lobby": lobby, "leaderboard": leaderboard}
 
     async def _provision_war(self, guild, verified, config) -> dict:
         me = guild.me
@@ -636,8 +683,9 @@ class SetupCog(commands.Cog, name="Setup"):
 
         channel_keys = (
             "verify_channel_id", "info_channel_id", "log_channel_id", "welcome_channel_id",
-            "member_list_channel_id", "general_channel_id", "memes_channel_id", "gifs_channel_id",
-            "lobby_voice_id", "community_category_id", "war_strategy_id", "war_voice_id",
+            "member_list_channel_id", "points_admin_channel_id", "general_channel_id",
+            "memes_channel_id", "gifs_channel_id", "lobby_voice_id", "points_board_channel_id",
+            "community_category_id", "war_strategy_id", "war_voice_id",
             "rally_leaders_channel_id", "rally_joiners_channel_id", "war_category_id", "category_id",
         )
         for key in channel_keys:
@@ -667,6 +715,8 @@ class SetupCog(commands.Cog, name="Setup"):
             welcome_channel_id=None, verify_message_id=None, general_channel_id=None,
             member_list_channel_id=None, member_list_message_id=None,
             community_category_id=None, memes_channel_id=None, gifs_channel_id=None, lobby_voice_id=None,
+            points_board_channel_id=None, points_board_message_id=None,
+            points_admin_channel_id=None, points_panel_message_id=None,
             war_category_id=None, war_strategy_id=None, war_voice_id=None,
             rally_leaders_channel_id=None, rally_joiners_channel_id=None,
             rally_leader_role_id=None, rally_joiner_role_id=None,
@@ -750,6 +800,7 @@ class SetupCog(commands.Cog, name="Setup"):
             member_role_id=member_role.id, leader_role_id=leader_role.id, category_id=category.id,
             chat_channel_id=chat.id, leaders_channel_id=leaders.id, voice_channel_id=voice.id,
         )
+        await self._apply_award_channel_perms(guild)  # let the new leader role see #award-points
         return await database.get_alliance(guild.id, tag)
 
     async def remove_alliance(self, guild, tag: str) -> bool:
@@ -773,6 +824,7 @@ class SetupCog(commands.Cog, name="Setup"):
                 except discord.HTTPException:
                     pass
         await database.delete_alliance(guild.id, tag)
+        await self._apply_award_channel_perms(guild)
         return True
 
     async def _post_verify_message(self, guild, verify_channel, kingdom, level):

@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import kingshot_api
 from views.verify_view import VerifyView
 from cogs.setup_cog import SetupPanelView
+from cogs.points import PointsPanelView
 
 # ─────────────────────────────────────────────
 # ENVIRONMENT & LOGGING
@@ -36,6 +37,7 @@ INITIAL_EXTENSIONS = [
     "cogs.tracker",
     "cogs.moderation",
     "cogs.giftcode",
+    "cogs.points",
 ]
 
 # ─────────────────────────────────────────────
@@ -58,6 +60,7 @@ class KingshotBot(commands.Bot):
         # Register persistent views so their buttons work after restarts.
         self.add_view(VerifyView())
         self.add_view(SetupPanelView())
+        self.add_view(PointsPanelView())
 
         # Sync application (slash) commands. Don't let a sync failure crash startup.
         try:

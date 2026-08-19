@@ -34,6 +34,28 @@ async def close() -> None:
     _session = None
 
 
+async def get_active_codes() -> list[dict]:
+    """
+    Fetch the list of currently-active Kingshot gift codes.
+
+    Returns a list of ``{"code", "expiresAt", "createdAt"}`` dicts (empty on any
+    failure). This LIST endpoint is live even though the redemption API is
+    bot-blocked, so it powers auto-announcing new codes.
+    """
+    url = f"{KINGSHOT_NET_BASE}/gift-codes"
+    try:
+        async with _get_session().get(url, headers=NET_HEADERS,
+                                      timeout=aiohttp.ClientTimeout(total=20)) as response:
+            if response.status != 200:
+                return []
+            data = await response.json(content_type=None)
+    except aiohttp.ClientError:
+        return []
+    if not isinstance(data, dict) or data.get("status") != "success":
+        return []
+    return (data.get("data") or {}).get("giftCodes", []) or []
+
+
 async def get_kingdom_stats(kingdom_id: int) -> dict:
     """Kingdom-tracker data for /age. Raises ValueError if unknown/unavailable."""
     url = f"{KINGSHOT_NET_BASE}/kingdom-tracker?kingdomId={kingdom_id}&recent=1&limit=20&sort=openTime-desc"
