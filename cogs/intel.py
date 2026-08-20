@@ -155,7 +155,7 @@ async def build_locate_embed(player_id: int) -> discord.Embed:
 
 
 class LocateModal(discord.ui.Modal, title="Locate a player"):
-    player_id = discord.ui.TextInput(label="In-game ID", placeholder="e.g. 73372825", required=True, max_length=20)
+    player_id = discord.ui.TextInput(label="In-game ID", placeholder="e.g. 123456789", required=True, max_length=20)
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = str(self.player_id.value).strip()
@@ -258,7 +258,7 @@ async def build_kingdom_embed(kid: int) -> discord.Embed:
 
 
 class KingdomModal(discord.ui.Modal, title="Look up a kingdom"):
-    kingdom_id = discord.ui.TextInput(label="Kingdom number", placeholder="e.g. 466", required=True, max_length=10)
+    kingdom_id = discord.ui.TextInput(label="Kingdom number", placeholder="e.g. 100", required=True, max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = str(self.kingdom_id.value).strip()
@@ -339,7 +339,7 @@ async def build_compare_embed(id_a: int, id_b: int) -> discord.Embed:
 
 
 class CompareModal(discord.ui.Modal, title="Compare two players"):
-    id_a = discord.ui.TextInput(label="Player A — in-game ID", placeholder="e.g. 73372825", required=True, max_length=20)
+    id_a = discord.ui.TextInput(label="Player A — in-game ID", placeholder="e.g. 123456789", required=True, max_length=20)
     id_b = discord.ui.TextInput(label="Player B — in-game ID", placeholder="e.g. 18163446", required=True, max_length=20)
 
     async def on_submit(self, interaction: discord.Interaction):
