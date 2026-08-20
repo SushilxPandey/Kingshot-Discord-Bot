@@ -90,6 +90,11 @@ class SetupModal(discord.ui.Modal, title="Bot Setup"):
         label="Minimum Town Center level (0 = no limit)",
         placeholder="e.g. 10", required=True, max_length=3, default="0",
     )
+    keep_verified = discord.ui.TextInput(
+        label="Keep already-verified members? (yes/no)",
+        placeholder="yes = existing verified players stay verified",
+        required=True, max_length=3, default="yes",
+    )
 
     def __init__(self, cog: "SetupCog", wipe: bool = True):
         super().__init__()
@@ -99,10 +104,11 @@ class SetupModal(discord.ui.Modal, title="Bot Setup"):
     async def on_submit(self, interaction: discord.Interaction):
         raw_k = str(self.kingdom.value).strip()
         raw_l = str(self.min_level.value).strip() or "0"
+        keep = str(self.keep_verified.value).strip().lower() in ("y", "yes", "true", "1")
         if not raw_k.isdigit() or not raw_l.isdigit():
             await interaction.response.send_message("Kingdom and level must be numbers.", ephemeral=True)
             return
-        await self.cog.run_provision(interaction, int(raw_k), level=int(raw_l), wipe=self.wipe)
+        await self.cog.run_provision(interaction, int(raw_k), level=int(raw_l), wipe=self.wipe, keep_verified=keep)
 
 
 class SetupPanelView(discord.ui.View):
@@ -352,7 +358,7 @@ class SetupCog(commands.Cog, name="Setup"):
                 pass
 
     # ── core provisioning ─────────────────────────────────────
-    async def run_provision(self, interaction, kingdom, level=0, wipe=True, reapply_backfill=True):
+    async def run_provision(self, interaction, kingdom, level=0, wipe=True, reapply_backfill=True, keep_verified=True):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
 
@@ -455,10 +461,12 @@ class SetupCog(commands.Cog, name="Setup"):
 
         await self.refresh_member_list(guild)
 
-        # 8. Re-gate existing members so they can (re-)verify. Skipped on /resync.
-        backfilled = 0
+        # 8. Existing members: optionally keep already-verified players verified (restoring
+        #    their role/nick/alliance from the saved DB); gate everyone else to Unverified.
+        #    Skipped on /resync.
+        kept = gated = 0
         if reapply_backfill:
-            backfilled = await self._backfill_members(guild, unverified, verified)
+            kept, gated = await self._apply_membership(guild, unverified, verified, keep_verified)
             await self.refresh_member_list(guild)
 
         summary = discord.Embed(
@@ -477,7 +485,7 @@ class SetupCog(commands.Cog, name="Setup"):
                 + (f"  •  **Min TC level:** {level}" if level else "") + "\n"
                 + f"**Channels locked for Unverified:** {swept}"
                 + (f" (skipped {skipped})" if skipped else "")
-                + (f"\n**Existing members set to Unverified:** {backfilled}" if reapply_backfill else "")
+                + (f"\n**Kept verified:** {kept}  •  **Set to Unverified:** {gated}" if reapply_backfill else "")
             ),
         )
         try:
@@ -760,24 +768,54 @@ class SetupCog(commands.Cog, name="Setup"):
         message = await info_channel.send(embed=embed)
         await database.upsert_config(guild.id, info_message_id=message.id)
 
-    async def _backfill_members(self, guild, unverified, verified) -> int:
+    async def _apply_membership(self, guild, unverified, verified, keep_verified) -> tuple[int, int]:
+        """Restore Verified for members with a saved record (when keep_verified), gate the
+        rest to Unverified. Returns (kept_verified, gated_unverified)."""
         if not guild.chunked:
             try:
                 await guild.chunk()
             except discord.HTTPException:
                 pass
-        count = 0
+        players = {p["discord_id"]: p for p in await database.all_players(guild.id)} if keep_verified else {}
+        verification = self.bot.get_cog("Verification")
+        kept = gated = 0
         for member in guild.members:
             if member.bot or member == guild.owner:
                 continue
-            if verified in member.roles or unverified in member.roles:
-                continue
-            try:
-                await member.add_roles(unverified, reason="Kingshot lockdown backfill")
-                count += 1
-            except discord.HTTPException:
-                continue
-        return count
+            record = players.get(str(member.id)) if keep_verified else None
+            if record:
+                # Restore this already-verified member's role, alliance role, and nickname.
+                try:
+                    if verified not in member.roles:
+                        await member.add_roles(verified, reason="Kingshot keep verified on setup")
+                    if unverified in member.roles:
+                        await member.remove_roles(unverified, reason="Kingshot keep verified on setup")
+                except discord.HTTPException:
+                    pass
+                tag = record.get("alliance")
+                if tag and verification:
+                    role = await verification.ensure_alliance_role(guild, tag)
+                    if role and role not in member.roles:
+                        try:
+                            await member.add_roles(role, reason="Kingshot keep verified on setup")
+                        except discord.HTTPException:
+                            pass
+                if record.get("ingame_name"):
+                    tag_part = f"{tag}- " if tag else ""
+                    nick = f"[{record['kingdom']}] {tag_part}{record['ingame_name']}"[:32]
+                    try:
+                        await member.edit(nick=nick, reason="Kingshot keep verified on setup")
+                    except discord.HTTPException:
+                        pass
+                kept += 1
+            else:
+                if verified not in member.roles and unverified not in member.roles:
+                    try:
+                        await member.add_roles(unverified, reason="Kingshot lockdown backfill")
+                        gated += 1
+                    except discord.HTTPException:
+                        continue
+        return kept, gated
 
     # ── listeners ─────────────────────────────────────────────
     @commands.Cog.listener()
