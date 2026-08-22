@@ -189,7 +189,7 @@ class Roster(commands.Cog, name="Roster"):
                 except discord.HTTPException:
                     pass
 
-    async def ensure_manage_panel(self, guild: discord.Guild):
+    async def ensure_manage_panel(self, guild: discord.Guild, force: bool = False):
         """Post the staff Member Management panel in the member-list channel."""
         config = await database.get_config(guild.id) or {}
         cid = config.get("member_list_channel_id")
@@ -199,8 +199,10 @@ class Roster(commands.Cog, name="Roster"):
         msg_id = config.get("manage_panel_message_id")
         if msg_id:
             try:
-                await channel.fetch_message(int(msg_id))
-                return
+                existing = await channel.fetch_message(int(msg_id))
+                if not force:
+                    return
+                await existing.delete()
             except (discord.NotFound, discord.HTTPException):
                 pass
         embed = discord.Embed(
@@ -253,8 +255,15 @@ class Roster(commands.Cog, name="Roster"):
         except Exception:
             await interaction.followup.send("Couldn't reach the game data right now. Try again later.", ephemeral=True)
             return
-        open_time_str = kingdom_data["data"]["servers"][0]["openTime"]
-        open_time = datetime.fromisoformat(open_time_str.replace("Z", "+00:00"))
+        try:
+            open_time_str = kingdom_data["data"]["servers"][0]["openTime"]
+            open_time = datetime.fromisoformat(str(open_time_str).replace("Z", "+00:00"))
+        except (KeyError, IndexError, TypeError, ValueError):
+            await interaction.followup.send(
+                f"I couldn't read the open date for kingdom {kingdom_id}. Try again later.",
+                ephemeral=True,
+            )
+            return
         days = (datetime.now(timezone.utc) - open_time).days
         embed = discord.Embed(
             title=f"Kingdom {kingdom_id} Age",
@@ -274,7 +283,7 @@ class Roster(commands.Cog, name="Roster"):
         await interaction.followup.send(msg, ephemeral=True)
 
     @app_commands.command(name="ban", description="Ban a member from the server and delete their record. Admins only.")
-    @app_commands.default_permissions(ban_members=True)
+    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(member="The member to ban", reason="Optional reason")
     @app_commands.guild_only()
     async def ban(self, interaction: discord.Interaction, member: discord.Member, reason: str | None = None):

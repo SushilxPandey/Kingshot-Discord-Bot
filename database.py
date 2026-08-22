@@ -38,6 +38,10 @@ _ID_COLUMNS = (
     "compare_channel_id", "compare_panel_message_id",
     "commands_channel_id", "commands_panel_message_id",
     "info_message_id", "manage_panel_message_id", "giftcode_channel_id",
+    # Insights + watchlist (power leaderboard, inactivity, enemy watch).
+    "leaderboard_channel_id", "leaderboard_message_id",
+    "warintel_channel_id", "warintel_panel_message_id",
+    "inactivity_message_id",
 )
 # Small integer config columns.
 _INT_COLUMNS = ("allowed_kingdom", "allowed_level", "lockdown_existing")
@@ -112,6 +116,39 @@ async def init_db() -> None:
                 verified_at  TIMESTAMPTZ,
                 last_checked TIMESTAMPTZ,
                 PRIMARY KEY (guild_id, discord_id)
+            )
+            """
+        )
+        # Snapshot columns added after the players table first shipped.
+        for ddl in (
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS power BIGINT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS kills BIGINT",
+            "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_active TIMESTAMPTZ",
+        ):
+            await conn.execute(ddl)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS power_history (
+                guild_id   TEXT NOT NULL,
+                discord_id TEXT NOT NULL,
+                day        DATE NOT NULL,
+                power      BIGINT,
+                PRIMARY KEY (guild_id, discord_id, day)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS watchlist (
+                guild_id     TEXT NOT NULL,
+                ingame_id    BIGINT NOT NULL,
+                label        TEXT,
+                added_by     TEXT,
+                last_power   BIGINT,
+                last_x       INTEGER,
+                last_y       INTEGER,
+                last_checked TIMESTAMPTZ,
+                PRIMARY KEY (guild_id, ingame_id)
             )
             """
         )
@@ -273,6 +310,101 @@ async def players_pending(guild_id) -> list[dict]:
             str(guild_id),
         )
         return [_player_row(r) for r in rows]
+
+
+# ──────────────────────────────────────────────────────────────
+# Insights: power snapshots, leaderboard, inactivity
+# ──────────────────────────────────────────────────────────────
+async def record_snapshot(guild_id, discord_id, power, kills, last_active) -> None:
+    """Store a member's current power/kills/last-active and today's power-history row."""
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            "UPDATE players SET power = $3, kills = $4, last_active = $5, last_checked = now() "
+            "WHERE guild_id = $1 AND discord_id = $2",
+            str(guild_id), str(discord_id), power, kills, last_active,
+        )
+        if power is not None:
+            await conn.execute(
+                """
+                INSERT INTO power_history (guild_id, discord_id, day, power)
+                VALUES ($1, $2, CURRENT_DATE, $3)
+                ON CONFLICT (guild_id, discord_id, day) DO UPDATE SET power = EXCLUDED.power
+                """,
+                str(guild_id), str(discord_id), power,
+            )
+
+
+async def players_with_power(guild_id) -> list[dict]:
+    """Verified members that have a recorded power, highest first."""
+    async with _pool_or_raise().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT discord_id, ingame_name, ingame_id, kingdom, alliance, power, kills, last_active "
+            "FROM players WHERE guild_id = $1 AND power IS NOT NULL ORDER BY power DESC",
+            str(guild_id),
+        )
+        return [dict(r) for r in rows]
+
+
+async def power_history_since(guild_id, since_date) -> list[dict]:
+    """All power-history rows on/after ``since_date`` (a date), oldest first."""
+    async with _pool_or_raise().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT discord_id, day, power FROM power_history "
+            "WHERE guild_id = $1 AND day >= $2 ORDER BY day ASC",
+            str(guild_id), since_date,
+        )
+        return [dict(r) for r in rows]
+
+
+async def inactive_players(guild_id, cutoff) -> list[dict]:
+    """Members whose last-active time is older than ``cutoff`` (an aware datetime)."""
+    async with _pool_or_raise().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT discord_id, ingame_name, ingame_id, alliance, last_active FROM players "
+            "WHERE guild_id = $1 AND last_active IS NOT NULL AND last_active < $2 "
+            "ORDER BY last_active ASC",
+            str(guild_id), cutoff,
+        )
+        return [dict(r) for r in rows]
+
+
+# ──────────────────────────────────────────────────────────────
+# Enemy watchlist
+# ──────────────────────────────────────────────────────────────
+async def add_watch(guild_id, ingame_id, label, added_by) -> None:
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO watchlist (guild_id, ingame_id, label, added_by) VALUES ($1, $2, $3, $4) "
+            "ON CONFLICT (guild_id, ingame_id) DO UPDATE SET label = EXCLUDED.label",
+            str(guild_id), int(ingame_id), label, str(added_by),
+        )
+
+
+async def remove_watch(guild_id, ingame_id) -> bool:
+    async with _pool_or_raise().acquire() as conn:
+        res = await conn.execute(
+            "DELETE FROM watchlist WHERE guild_id = $1 AND ingame_id = $2",
+            str(guild_id), int(ingame_id),
+        )
+        return res.split()[-1] != "0"
+
+
+async def all_watch(guild_id) -> list[dict]:
+    async with _pool_or_raise().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM watchlist WHERE guild_id = $1 ORDER BY last_power DESC NULLS LAST",
+            str(guild_id),
+        )
+        return [dict(r) for r in rows]
+
+
+async def update_watch(guild_id, ingame_id, last_power, last_x, last_y) -> None:
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            "UPDATE watchlist SET last_power = $3, last_x = $4, last_y = $5, last_checked = now() "
+            "WHERE guild_id = $1 AND ingame_id = $2",
+            str(guild_id), int(ingame_id), last_power, last_x, last_y,
+        )
 
 
 async def players_by_alliance(guild_id, tag) -> list[dict]:

@@ -128,7 +128,7 @@ async def build_scout_embed(player_id: int, count: int = 5) -> discord.Embed:
 # ──────────────────────────────────────────────────────────────
 class ScoutModal(discord.ui.Modal, title="Scout an enemy alliance"):
     player_id = discord.ui.TextInput(
-        label="Enemy player's in-game ID", placeholder="e.g. 73372825", required=True, max_length=20
+        label="Enemy player's in-game ID", placeholder="e.g. 12345678", required=True, max_length=20
     )
     count = discord.ui.TextInput(
         label="How many top players (1–10)", required=False, max_length=2, default="5"
@@ -147,7 +147,7 @@ class ScoutModal(discord.ui.Modal, title="Scout an enemy alliance"):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, view=ScoutPanelView())
 
 
 class ScoutPanelView(discord.ui.View):
@@ -176,9 +176,9 @@ class Scout(commands.Cog, name="Scout"):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, view=ScoutPanelView())
 
-    async def ensure_panel(self, guild: discord.Guild):
+    async def ensure_panel(self, guild: discord.Guild, force: bool = False):
         await _ensure_panel(
             guild, "scout_channel_id", "scout_panel_message_id", ScoutPanelView(),
             title="🎯 Scout Opponents",
@@ -187,11 +187,13 @@ class Scout(commands.Cog, name="Scout"):
                 "I'll pull their whole alliance and show the top players with their power, "
                 "Town Center, heroes, and gear — ready for KvK planning."
             ),
+            force=force,
         )
 
 
-async def _ensure_panel(guild, channel_key, message_key, view, title, description):
-    """Post a persistent panel in the configured channel if it isn't there yet."""
+async def _ensure_panel(guild, channel_key, message_key, view, title, description, force=False):
+    """Post a persistent panel in the configured channel. If ``force``, replace the
+    existing panel (used on /resync so refreshed buttons/text actually appear)."""
     config = await database.get_config(guild.id) or {}
     cid = config.get(channel_key)
     channel = guild.get_channel(int(cid)) if cid else None
@@ -200,8 +202,10 @@ async def _ensure_panel(guild, channel_key, message_key, view, title, descriptio
     msg_id = config.get(message_key)
     if msg_id:
         try:
-            await channel.fetch_message(int(msg_id))
-            return
+            existing = await channel.fetch_message(int(msg_id))
+            if not force:
+                return
+            await existing.delete()   # re-post below with the current view/text
         except (discord.NotFound, discord.HTTPException):
             pass
     embed = discord.Embed(title=title, description=description, color=discord.Color.blurple())

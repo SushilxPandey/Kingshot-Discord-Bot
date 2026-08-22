@@ -23,6 +23,7 @@ from cogs.intel import (
     LocatePanelView, SelfPanelView, KingdomPanelView, ComparePanelView, CommandsPanelView,
 )
 from cogs.roster import ManagePanelView
+from cogs.watch import WarIntelPanelView
 
 # ─────────────────────────────────────────────
 # ENVIRONMENT & LOGGING
@@ -44,6 +45,8 @@ INITIAL_EXTENSIONS = [
     "cogs.giftcode",
     "cogs.scout",
     "cogs.intel",
+    "cogs.insights",
+    "cogs.watch",
 ]
 
 # ─────────────────────────────────────────────
@@ -77,6 +80,7 @@ class KingshotBot(commands.Bot):
         self.add_view(ComparePanelView())
         self.add_view(CommandsPanelView())
         self.add_view(ManagePanelView())
+        self.add_view(WarIntelPanelView())
 
         # Sync application (slash) commands. Don't let a sync failure crash startup.
         try:

@@ -98,7 +98,7 @@ def _normalize_player(match: dict, ingame_id) -> dict:
         "uid": match.get("uid"),
         "aid": match.get("aid"),
         "kingdom": _to_int(match.get("kid")),
-        "level": _to_int(match.get("town_center_level", match.get("stove_lv"))),
+        "level": _to_int(match.get("town_center_level") or match.get("stove_lv")),
         "levelRendered": match.get("town_center_level") or match.get("stove_lv") or "Unknown",
         "alliance_abbr": match.get("alliance_abbr"),
         "alliance_name": match.get("alliance_name"),

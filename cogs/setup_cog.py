@@ -28,39 +28,41 @@ import database
 from views.verify_view import VerifyView
 
 CATEGORY_NAME = "🤖 Bot Center"
-VERIFY_CHANNEL_NAME = "verify-here"
-INFO_CHANNEL_NAME = "bot-info"
-LOG_CHANNEL_NAME = "bot-log"
-WELCOME_CHANNEL_NAME = "welcome"
-SETUP_CHANNEL_NAME = "bot-setup"
-MEMBER_LIST_CHANNEL_NAME = "member-list"
+VERIFY_CHANNEL_NAME = "🔒 verify-here"
+INFO_CHANNEL_NAME = "ℹ️ bot-info"
+LOG_CHANNEL_NAME = "📜 bot-log"
+WELCOME_CHANNEL_NAME = "👋 welcome"
+SETUP_CHANNEL_NAME = "🛠️ bot-setup"
+MEMBER_LIST_CHANNEL_NAME = "📋 member-list"
 UNVERIFIED_ROLE_NAME = "Unverified"
 VERIFIED_ROLE_NAME = "Verified"
 
 # Community (social) section — lives OUTSIDE the bot category.
 COMMUNITY_CATEGORY_NAME = "💬 Community"
-GENERAL_CHANNEL_NAME = "general"
-GIFTCODE_CHANNEL_NAME = "gift-codes"
-MEMES_CHANNEL_NAME = "memes"
-GIFS_CHANNEL_NAME = "gifs"
-LOBBY_VOICE_NAME = "Lobby"
+GENERAL_CHANNEL_NAME = "💬 general"
+GIFTCODE_CHANNEL_NAME = "🎁 gift-codes"
+LEADERBOARD_CHANNEL_NAME = "📈 leaderboard"
+MEMES_CHANNEL_NAME = "😂 memes"
+GIFS_CHANNEL_NAME = "🎞️ gifs"
+LOBBY_VOICE_NAME = "🔊 Lobby"
 
 # Bot Tools section — button-first tool pages.
 TOOLS_CATEGORY_NAME = "🛰️ Bot Tools"
-SCOUT_CHANNEL_NAME = "scout-opponents"
-LOCATE_CHANNEL_NAME = "locate-player"
-SELFSTATS_CHANNEL_NAME = "my-stats"
-KINGDOM_CHANNEL_NAME = "kingdom-intel"
-COMPARE_CHANNEL_NAME = "compare-players"
-COMMANDS_CHANNEL_NAME = "bot-commands"
+SCOUT_CHANNEL_NAME = "🎯 scout-opponents"
+LOCATE_CHANNEL_NAME = "📍 locate-player"
+SELFSTATS_CHANNEL_NAME = "🪞 player-stats"
+KINGDOM_CHANNEL_NAME = "🏰 kingdom-intel"
+COMPARE_CHANNEL_NAME = "⚖️ compare-players"
+COMMANDS_CHANNEL_NAME = "🤖 bot-commands"
 
 SETUP_MSG_TTL = 15                   # setup status messages self-delete after 15s
 
 WAR_CATEGORY_NAME = "⚔️ War"
-WAR_STRATEGY_NAME = "war-strategy"
-WAR_VOICE_NAME = "War Voice"
-RALLY_LEADERS_CHANNEL = "rally-leaders"
-RALLY_JOINERS_CHANNEL = "rally-joiners"
+WAR_STRATEGY_NAME = "🗺️ war-strategy"
+WAR_VOICE_NAME = "🔊 War Voice"
+WARINTEL_CHANNEL_NAME = "🕵️ war-intel"
+RALLY_LEADERS_CHANNEL = "📣 rally-leaders"
+RALLY_JOINERS_CHANNEL = "⚔️ rally-joiners"
 RALLY_LEADER_ROLE = "Rally Leaders"
 RALLY_JOINER_ROLE = "Rally Joiners"
 
@@ -248,6 +250,7 @@ class SetupCog(commands.Cog, name="Setup"):
                 await channel.edit(overwrites=overwrites, reason="Kingshot setup room visibility")
             except discord.HTTPException:
                 pass
+            await self._rename_if_needed(channel, SETUP_CHANNEL_NAME)
         else:
             channel = await guild.create_text_channel(
                 SETUP_CHANNEL_NAME, overwrites=overwrites, reason="Kingshot setup room"
@@ -422,12 +425,12 @@ class SetupCog(commands.Cog, name="Setup"):
             info_channel_id=info_channel.id, log_channel_id=log_channel.id,
             welcome_channel_id=welcome_channel.id, member_list_channel_id=member_list_channel.id,
             community_category_id=community["category"].id, general_channel_id=general_channel.id,
-            giftcode_channel_id=community["giftcodes"].id,
+            giftcode_channel_id=community["giftcodes"].id, leaderboard_channel_id=community["leaderboard"].id,
             memes_channel_id=community["memes"].id, gifs_channel_id=community["gifs"].id,
             lobby_voice_id=community["lobby"].id,
             war_category_id=war["category"].id, war_strategy_id=war["strategy"].id,
             war_voice_id=war["voice"].id, rally_leaders_channel_id=war["rally_leaders"].id,
-            rally_joiners_channel_id=war["rally_joiners"].id,
+            rally_joiners_channel_id=war["rally_joiners"].id, warintel_channel_id=war["warintel"].id,
             rally_leader_role_id=war["leader_role"].id, rally_joiner_role_id=war["joiner_role"].id,
             tools_category_id=tools["category"].id,
             scout_channel_id=tools["scout"].id, locate_channel_id=tools["locate"].id,
@@ -446,18 +449,27 @@ class SetupCog(commands.Cog, name="Setup"):
         await self._post_info_help(guild, info_channel)
 
         # 7. Post every tool panel + tell moderation which channel is gifs-only.
+        # On /resync (no wipe) the channels already have old panels — force a refresh so
+        # updated buttons/text appear. On a fresh wipe there's nothing to replace.
+        refresh_panels = not wipe
         scout_cog = self.bot.get_cog("Scout")
         if scout_cog:
-            await scout_cog.ensure_panel(guild)
+            await scout_cog.ensure_panel(guild, force=refresh_panels)
         intel_cog = self.bot.get_cog("Intel")
         if intel_cog:
-            await intel_cog.ensure_panels(guild)
+            await intel_cog.ensure_panels(guild, force=refresh_panels)
         mod_cog = self.bot.get_cog("Moderation")
         if mod_cog:
             mod_cog.note_gifs_channel(guild.id, community["gifs"].id)
         roster_cog = self.bot.get_cog("Roster")
         if roster_cog:
-            await roster_cog.ensure_manage_panel(guild)
+            await roster_cog.ensure_manage_panel(guild, force=refresh_panels)
+        watch_cog = self.bot.get_cog("Watch")
+        if watch_cog:
+            await watch_cog.ensure_panel(guild, force=refresh_panels)
+        insights_cog = self.bot.get_cog("Insights")
+        if insights_cog:
+            await insights_cog.ensure_boards(guild)
 
         await self.refresh_member_list(guild)
 
@@ -474,10 +486,11 @@ class SetupCog(commands.Cog, name="Setup"):
             description=(
                 f"**Verify:** {verify_channel.mention}  •  **Welcome:** {welcome_channel.mention}\n"
                 f"**Community:** {general_channel.mention}, {community['giftcodes'].mention}, "
-                f"{community['memes'].mention}, {community['gifs'].mention}, 🔊 {community['lobby'].name}\n"
+                f"{community['leaderboard'].mention}, {community['memes'].mention}, "
+                f"{community['gifs'].mention}, 🔊 {community['lobby'].name}\n"
                 f"**Staff:** {member_list_channel.mention}, {log_channel.mention}, {info_channel.mention}\n"
-                f"**War:** {war['strategy'].mention}, {war['rally_leaders'].mention}, "
-                f"{war['rally_joiners'].mention}, 🔊 {war['voice'].name}\n"
+                f"**War:** {war['strategy'].mention}, {war['warintel'].mention}, "
+                f"{war['rally_leaders'].mention}, {war['rally_joiners'].mention}, 🔊 {war['voice'].name}\n"
                 f"**Bot Tools:** {tools['scout'].mention}, {tools['locate'].mention}, "
                 f"{tools['selfstats'].mention}, {tools['kingdom'].mention}, "
                 f"{tools['compare'].mention}, {tools['commands'].mention}\n"
@@ -517,11 +530,13 @@ class SetupCog(commands.Cog, name="Setup"):
             me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
         }
         giftcodes = await self._ensure_text_channel(guild, config.get("giftcode_channel_id"), GIFTCODE_CHANNEL_NAME, category, readonly)
+        # Power leaderboard: everyone verified reads, only the bot posts (read-only).
+        leaderboard = await self._ensure_text_channel(guild, config.get("leaderboard_channel_id"), LEADERBOARD_CHANNEL_NAME, category, readonly)
         memes = await self._ensure_text_channel(guild, config.get("memes_channel_id"), MEMES_CHANNEL_NAME, category, overwrites)
         gifs = await self._ensure_text_channel(guild, config.get("gifs_channel_id"), GIFS_CHANNEL_NAME, category, overwrites)
         lobby = await self._ensure_voice_channel(guild, config.get("lobby_voice_id"), LOBBY_VOICE_NAME, category, overwrites)
         return {"category": category, "general": general, "giftcodes": giftcodes,
-                "memes": memes, "gifs": gifs, "lobby": lobby}
+                "leaderboard": leaderboard, "memes": memes, "gifs": gifs, "lobby": lobby}
 
     async def _provision_war(self, guild, verified, config) -> dict:
         me = guild.me
@@ -543,8 +558,15 @@ class SetupCog(commands.Cog, name="Setup"):
         rally_leaders = await self._ensure_text_channel(guild, config.get("rally_leaders_channel_id"), RALLY_LEADERS_CHANNEL, category, overwrites)
         rally_joiners = await self._ensure_text_channel(guild, config.get("rally_joiners_channel_id"), RALLY_JOINERS_CHANNEL, category, overwrites)
         voice = await self._ensure_voice_channel(guild, config.get("war_voice_id"), WAR_VOICE_NAME, category, overwrites)
+        # War-intel (enemy watchlist): verified read + use the panel buttons, bot posts alerts.
+        intel_ro = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            verified: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=True),
+            me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        warintel = await self._ensure_text_channel(guild, config.get("warintel_channel_id"), WARINTEL_CHANNEL_NAME, category, intel_ro)
         return {"category": category, "strategy": strategy, "voice": voice,
-                "rally_leaders": rally_leaders, "rally_joiners": rally_joiners,
+                "rally_leaders": rally_leaders, "rally_joiners": rally_joiners, "warintel": warintel,
                 "leader_role": leader_role, "joiner_role": joiner_role}
 
     async def _provision_tools(self, guild, verified, config) -> dict:
@@ -581,9 +603,10 @@ class SetupCog(commands.Cog, name="Setup"):
 
         channel_keys = (
             "verify_channel_id", "info_channel_id", "log_channel_id", "welcome_channel_id",
-            "member_list_channel_id", "general_channel_id", "giftcode_channel_id",
+            "member_list_channel_id", "general_channel_id", "giftcode_channel_id", "leaderboard_channel_id",
             "memes_channel_id", "gifs_channel_id", "lobby_voice_id", "community_category_id",
-            "war_strategy_id", "war_voice_id", "rally_leaders_channel_id", "rally_joiners_channel_id",
+            "war_strategy_id", "war_voice_id", "warintel_channel_id",
+            "rally_leaders_channel_id", "rally_joiners_channel_id",
             "war_category_id", "category_id",
             "scout_channel_id", "locate_channel_id", "selfstats_channel_id", "kingdom_channel_id",
             "compare_channel_id", "commands_channel_id", "tools_category_id",
@@ -616,6 +639,8 @@ class SetupCog(commands.Cog, name="Setup"):
             verify_channel_id=None, info_channel_id=None, log_channel_id=None,
             welcome_channel_id=None, verify_message_id=None, info_message_id=None,
             general_channel_id=None, giftcode_channel_id=None,
+            leaderboard_channel_id=None, leaderboard_message_id=None,
+            warintel_channel_id=None, warintel_panel_message_id=None, inactivity_message_id=None,
             member_list_channel_id=None, member_list_message_id=None, manage_panel_message_id=None,
             community_category_id=None, memes_channel_id=None, gifs_channel_id=None, lobby_voice_id=None,
             war_category_id=None, war_strategy_id=None, war_voice_id=None,
@@ -656,6 +681,20 @@ class SetupCog(commands.Cog, name="Setup"):
         return True
 
     # ── generic ensure helpers ────────────────────────────────
+    @staticmethod
+    def _needs_rename(current: str, desired: str) -> bool:
+        """True if the channel should be renamed. Treats Discord's space→hyphen and
+        lowercasing of text-channel names as equivalent so we don't rename on every run."""
+        norm = lambda s: s.replace("-", " ").strip().casefold()
+        return norm(current) != norm(desired)
+
+    async def _rename_if_needed(self, chan, desired: str):
+        try:
+            if self._needs_rename(chan.name, desired):
+                await chan.edit(name=desired, reason="Kingshot channel icons")
+        except discord.HTTPException:
+            pass
+
     async def _ensure_role(self, guild, role_id, name, **kwargs) -> discord.Role:
         if role_id:
             role = guild.get_role(int(role_id))
@@ -674,6 +713,7 @@ class SetupCog(commands.Cog, name="Setup"):
         if channel_id:
             chan = guild.get_channel(int(channel_id))
             if isinstance(chan, discord.TextChannel):
+                await self._rename_if_needed(chan, name)   # apply/refresh the emoji icon
                 return chan
         return await guild.create_text_channel(name, category=category, overwrites=overwrites, reason="Kingshot bot setup")
 
@@ -681,6 +721,7 @@ class SetupCog(commands.Cog, name="Setup"):
         if channel_id:
             chan = guild.get_channel(int(channel_id))
             if isinstance(chan, discord.VoiceChannel):
+                await self._rename_if_needed(chan, name)
                 return chan
         return await guild.create_voice_channel(name, category=category, overwrites=overwrites, reason="Kingshot bot setup")
 
@@ -752,9 +793,16 @@ class SetupCog(commands.Cog, name="Setup"):
             name="🛰️ Bot Tools (click the buttons)",
             value=("🎯 **Scout Opponents** — see any enemy alliance's top players, heroes & gear.\n"
                    "📍 **Locate a Player** — kingdom, map coordinates, alliance, activity.\n"
-                   "🪞 **My Stats** — your own detailed profile with power, ranks, heroes.\n"
+                   "🪞 **Player Stats** — your own profile, or look up anyone by ID.\n"
                    "🏰 **Kingdom Knowledge** — a kingdom's battle stats and its top 10 players.\n"
                    "⚖️ **Compare Players** — two players side by side."),
+            inline=False,
+        )
+        embed.add_field(
+            name="📈 Leaderboard & 🕵️ war-intel",
+            value=("The **leaderboard** channel tracks everyone's power and who's climbing fastest each "
+                   "week. In **war-intel**, add enemy players to a watchlist and get alerts when they "
+                   "make a big power move or relocate."),
             inline=False,
         )
         embed.add_field(

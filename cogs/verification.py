@@ -47,6 +47,15 @@ class Verification(commands.Cog, name="Verification"):
         allowed_kingdom = config["allowed_kingdom"]
         allowed_level = config.get("allowed_level") or 0
 
+        # Sanity-check the ID range so an absurd number can't overflow the BIGINT column.
+        if ingame_id <= 0 or ingame_id > 9_223_372_036_854_775_807:
+            await interaction.followup.send(
+                "That doesn't look like a valid in-game ID. Double-check the number on your "
+                "profile and try again.",
+                ephemeral=True,
+            )
+            return
+
         # One in-game player may only be linked to one Discord account per server.
         claim = await database.player_by_ingame_id(guild.id, ingame_id)
         if claim and str(claim.get("discord_id")) != str(member.id):
@@ -76,6 +85,12 @@ class Verification(commands.Cog, name="Verification"):
                 real_level = int(lookup.get("level"))
             except (TypeError, ValueError):
                 real_level = 0
+            if real_kingdom is None:
+                await interaction.followup.send(
+                    "I couldn't read your account's kingdom just now — please try again in a moment.",
+                    ephemeral=True,
+                )
+                return
             if real_kingdom != allowed_kingdom:
                 await interaction.followup.send(
                     f"That account is in kingdom **{real_kingdom}**, but this server only "

@@ -116,7 +116,10 @@ class Moderation(commands.Cog, name="Moderation"):
         # Delete + repost censored (original behaviour).
         try:
             await message.delete()
-            await message.channel.send(f"{message.author.display_name}: {cleaned}")
+            await message.channel.send(
+                f"{message.author.display_name}: {cleaned}",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
         except discord.Forbidden:
             logging.warning("Missing permission to moderate message in %s", message.channel)
         except discord.HTTPException:

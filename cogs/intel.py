@@ -47,13 +47,31 @@ def _num(v) -> str:
     return f"{n:,}" if n is not None else "—"
 
 
+def _fmt_ts(val) -> str | None:
+    """Format a timestamp that may be a Unix epoch (int/float/str) or an ISO string."""
+    if val in (None, "", 0):
+        return None
+    # Numeric → treat as epoch seconds.
+    try:
+        secs = float(val)
+        if secs > 1_000_000_000:  # ~2001+, i.e. a real epoch timestamp
+            from datetime import datetime, timezone
+            return datetime.fromtimestamp(secs, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError):
+        pass
+    s = str(val)
+    if "T" in s:  # ISO 8601 string
+        return s[:16].replace("T", " ")
+    return None
+
+
 def _activity(detail: dict) -> str:
     if detail.get("online"):
         return "🟢 Online now"
-    for key in ("last_active_at", "last_login"):
-        val = detail.get(key)
-        if val:
-            return f"🕓 Last seen {str(val)[:16].replace('T', ' ')}"
+    for key in ("last_active_at", "last_login", "last_seen_at"):
+        ts = _fmt_ts(detail.get(key))
+        if ts:
+            return f"🕓 Last seen {ts}"
     return "—"
 
 
@@ -78,8 +96,12 @@ def _top_hero(detail: dict) -> str:
     return f"{h.get('name', '?')} {star} L{lv}"
 
 
-async def _resolve(player_id: int) -> tuple[dict | None, dict | None, str | None]:
-    """Return (search_data, full_detail, error). error is a user-facing message or None."""
+async def _resolve(player_id: int, with_detail: bool = True) -> tuple[dict | None, dict | None, str | None]:
+    """Return (search_data, full_detail, error). error is a user-facing message or None.
+
+    ``with_detail=False`` skips the extra heroes/gear profile fetch — used by Locate,
+    which only needs the lightweight search fields (kingdom, coords, alliance, activity).
+    """
     try:
         info = await kingshot_api.get_player_info(player_id)
     except Exception:
@@ -87,7 +109,9 @@ async def _resolve(player_id: int) -> tuple[dict | None, dict | None, str | None
     data = info.get("data") or None
     if not data:
         return None, None, f"Couldn't find a Kingshot player with ID **{player_id}**."
-    detail = await kingshot_api.get_player_detail(data.get("uid")) if data.get("uid") else None
+    detail = None
+    if with_detail and data.get("uid"):
+        detail = await kingshot_api.get_player_detail(data.get("uid"))
     return data, detail, None
 
 
@@ -134,7 +158,8 @@ def build_player_embed(data: dict, detail: dict | None, *, title_prefix: str = "
 # Locate
 # ──────────────────────────────────────────────────────────────
 async def build_locate_embed(player_id: int) -> discord.Embed:
-    data, detail, err = await _resolve(player_id)
+    # Locate only needs the light search fields, so skip the heavy detail fetch.
+    data, detail, err = await _resolve(player_id, with_detail=False)
     if err:
         raise ValueError(err)
     m = _merge(data, detail)
@@ -155,7 +180,7 @@ async def build_locate_embed(player_id: int) -> discord.Embed:
 
 
 class LocateModal(discord.ui.Modal, title="Locate a player"):
-    player_id = discord.ui.TextInput(label="In-game ID", placeholder="e.g. 123456789", required=True, max_length=20)
+    player_id = discord.ui.TextInput(label="In-game ID", placeholder="e.g. 12345678", required=True, max_length=20)
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = str(self.player_id.value).strip()
@@ -168,7 +193,7 @@ class LocateModal(discord.ui.Modal, title="Locate a player"):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True, view=LocatePanelView())
 
 
 class LocatePanelView(discord.ui.View):
@@ -181,15 +206,43 @@ class LocatePanelView(discord.ui.View):
 
 
 # ──────────────────────────────────────────────────────────────
-# Look Yourself
+# Player Stats — your own, or look anyone up by game ID
 # ──────────────────────────────────────────────────────────────
+async def build_lookup_embed(player_id: int) -> discord.Embed:
+    data, detail, err = await _resolve(player_id, with_detail=True)
+    if err:
+        raise ValueError(err)
+    return build_player_embed(data, detail, title_prefix="👤 ")
+
+
+class LookupModal(discord.ui.Modal, title="Look up a player"):
+    player_id = discord.ui.TextInput(label="In-game ID", placeholder="e.g. 12345678", required=True, max_length=20)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.player_id.value).strip()
+        if not raw.isdigit():
+            await interaction.response.send_message("The in-game ID should be numbers only.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        try:
+            embed = await build_lookup_embed(int(raw))
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        await interaction.followup.send(embed=embed, view=SelfPanelView())
+
+
 class SelfPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Show my stats", style=discord.ButtonStyle.success, emoji="🪞", custom_id="ks_self_open")
+    @discord.ui.button(label="My stats", style=discord.ButtonStyle.success, emoji="🪞", custom_id="ks_self_open")
     async def self_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _send_self_stats(interaction)
+
+    @discord.ui.button(label="Look up a player", style=discord.ButtonStyle.primary, emoji="👤", custom_id="ks_lookup_open")
+    async def lookup_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LookupModal())
 
 
 async def _send_self_stats(interaction: discord.Interaction):
@@ -205,7 +258,7 @@ async def _send_self_stats(interaction: discord.Interaction):
         await interaction.followup.send(err, ephemeral=True)
         return
     embed = build_player_embed(data, detail, title_prefix="🪞 ")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True, view=SelfPanelView())
 
 
 # ──────────────────────────────────────────────────────────────
@@ -258,7 +311,7 @@ async def build_kingdom_embed(kid: int) -> discord.Embed:
 
 
 class KingdomModal(discord.ui.Modal, title="Look up a kingdom"):
-    kingdom_id = discord.ui.TextInput(label="Kingdom number", placeholder="e.g. 100", required=True, max_length=10)
+    kingdom_id = discord.ui.TextInput(label="Kingdom number", placeholder="e.g. 466", required=True, max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = str(self.kingdom_id.value).strip()
@@ -271,7 +324,7 @@ class KingdomModal(discord.ui.Modal, title="Look up a kingdom"):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, view=KingdomPanelView())
 
 
 class KingdomPanelView(discord.ui.View):
@@ -291,7 +344,7 @@ class KingdomPanelView(discord.ui.View):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, view=KingdomPanelView())
 
     @discord.ui.button(label="Another kingdom", style=discord.ButtonStyle.secondary, emoji="🔎", custom_id="ks_kingdom_other")
     async def other_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -339,8 +392,8 @@ async def build_compare_embed(id_a: int, id_b: int) -> discord.Embed:
 
 
 class CompareModal(discord.ui.Modal, title="Compare two players"):
-    id_a = discord.ui.TextInput(label="Player A — in-game ID", placeholder="e.g. 123456789", required=True, max_length=20)
-    id_b = discord.ui.TextInput(label="Player B — in-game ID", placeholder="e.g. 18163446", required=True, max_length=20)
+    id_a = discord.ui.TextInput(label="Player A — in-game ID", placeholder="e.g. 12345678", required=True, max_length=20)
+    id_b = discord.ui.TextInput(label="Player B — in-game ID", placeholder="e.g. 87654321", required=True, max_length=20)
 
     async def on_submit(self, interaction: discord.Interaction):
         ra, rb = str(self.id_a.value).strip(), str(self.id_b.value).strip()
@@ -353,7 +406,7 @@ class CompareModal(discord.ui.Modal, title="Compare two players"):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, view=ComparePanelView())
 
 
 class ComparePanelView(discord.ui.View):
@@ -411,12 +464,24 @@ class Intel(commands.Cog, name="Intel"):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True, view=LocatePanelView())
 
     @app_commands.command(name="mystats", description="Show your detailed Kingshot stats.")
     @app_commands.guild_only()
     async def mystats(self, interaction: discord.Interaction):
         await _send_self_stats(interaction)
+
+    @app_commands.command(name="lookup", description="Look up any player's detailed stats by their in-game ID.")
+    @app_commands.describe(player_id="The player's in-game ID")
+    @app_commands.guild_only()
+    async def lookup(self, interaction: discord.Interaction, player_id: int):
+        await interaction.response.defer(thinking=True)
+        try:
+            embed = await build_lookup_embed(player_id)
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        await interaction.followup.send(embed=embed, view=SelfPanelView())
 
     @app_commands.command(name="kingdom", description="Show a kingdom's battle stats and its top 10 players.")
     @app_commands.describe(kingdom_id="Kingdom number (defaults to this server's kingdom)")
@@ -434,7 +499,7 @@ class Intel(commands.Cog, name="Intel"):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, view=KingdomPanelView())
 
     @app_commands.command(name="compare", description="Compare two players side by side.")
     @app_commands.describe(player_a="First player's in-game ID", player_b="Second player's in-game ID")
@@ -446,32 +511,37 @@ class Intel(commands.Cog, name="Intel"):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, view=ComparePanelView())
 
     # ── panel provisioning (called by setup) ──────────────────
-    async def ensure_panels(self, guild: discord.Guild):
+    async def ensure_panels(self, guild: discord.Guild, force: bool = False):
         await _ensure_panel(
             guild, "locate_channel_id", "locate_panel_message_id", LocatePanelView(),
             title="📍 Locate a Player",
             description="Press the button and enter a player's in-game ID to see their kingdom, "
                         "map coordinates, alliance, and activity.",
+            force=force,
         )
         await _ensure_panel(
             guild, "selfstats_channel_id", "selfstats_panel_message_id", SelfPanelView(),
-            title="🪞 Look Yourself Up",
-            description="Press **Show my stats** to see your own detailed Kingshot profile — power, "
-                        "ranks, kills, heroes, and gear. (You need to be verified.)",
+            title="🪞 Player Stats",
+            description="**My stats** — see your own detailed profile (power, ranks, kills, heroes, gear). "
+                        "You need to be verified.\n"
+                        "**Look up a player** — enter any in-game ID to see that player's full stats.",
+            force=force,
         )
         await _ensure_panel(
             guild, "kingdom_channel_id", "kingdom_panel_message_id", KingdomPanelView(),
             title="🏰 Kingdom Knowledge",
             description="See a kingdom's battle stats and its top 10 players. **Our kingdom** shows "
                         "this server's kingdom; **Another kingdom** lets you look up any number.",
+            force=force,
         )
         await _ensure_panel(
             guild, "compare_channel_id", "compare_panel_message_id", ComparePanelView(),
             title="⚖️ Compare Players",
             description="Press **Compare players** and enter two in-game IDs to see them side by side.",
+            force=force,
         )
         await _ensure_panel(
             guild, "commands_channel_id", "commands_panel_message_id", CommandsPanelView(),
@@ -481,12 +551,14 @@ class Intel(commands.Cog, name="Intel"):
                 "• `/scout` — scout an enemy alliance\n"
                 "• `/locate` — find a player\n"
                 "• `/mystats` — your detailed stats\n"
+                "• `/lookup` — any player's stats by ID\n"
                 "• `/kingdom` — kingdom stats & top 10\n"
                 "• `/compare` — compare two players\n"
                 "• `/age` — how long a kingdom has been open\n"
                 "• `/roster`, `/unverify` — admin tools\n\n"
                 "**Admins:** use the button below to broadcast a gift code to everyone."
             ),
+            force=force,
         )
 
 

@@ -19,7 +19,7 @@ class VerifyModal(discord.ui.Modal):
         self.is_reverify = is_reverify
 
         self.ingame_id = discord.ui.TextInput(
-            label="In-game ID", placeholder="e.g. 73372825", required=True, max_length=20
+            label="In-game ID", placeholder="e.g. 12345678", required=True, max_length=20
         )
         self.add_item(self.ingame_id)
 

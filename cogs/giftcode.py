@@ -21,7 +21,7 @@ import database
 import kingshot_api
 
 REDEEM_URL = "https://ks-giftcode.centurygame.com/"
-POLL_HOURS = 2   # how often to check for new active codes
+POLL_MINUTES = 10   # how often to check for new active codes
 
 
 def _code_embed(code: str, author: discord.abc.User | None = None) -> discord.Embed:
@@ -92,30 +92,35 @@ class GiftCode(commands.Cog, name="GiftCode"):
         await interaction.followup.send(msg, ephemeral=True)
 
     # ── auto-announce new codes (the LIST endpoint is live) ───
-    @tasks.loop(hours=POLL_HOURS)
+    @tasks.loop(minutes=POLL_MINUTES)
     async def check_codes(self):
         codes = await kingshot_api.get_active_codes()
         if not codes:
             return
         for guild_id in await database.list_guild_ids():
-            guild = self.bot.get_guild(int(guild_id))
-            if guild is None:
-                continue
-            config = await database.get_config(guild_id)
-            if not config:
-                continue
-            channel_id = config.get("giftcode_channel_id") or config.get("general_channel_id")
-            channel = guild.get_channel(int(channel_id)) if channel_id else None
-            verified_role = guild.get_role(config["verified_role_id"]) if config.get("verified_role_id") else None
-            # First poll for this guild: seed silently so we don't dump the backlog.
-            seed = await database.announced_count(guild_id) == 0
-            for c in codes:
-                code = c.get("code")
-                if not code:
+            try:
+                guild = self.bot.get_guild(int(guild_id))
+                if guild is None:
                     continue
-                is_new = await database.mark_code_announced(guild_id, code, c.get("createdAt"))
-                if is_new and not seed and channel:
-                    await self._announce_new_code(channel, verified_role, code)
+                config = await database.get_config(guild_id)
+                if not config:
+                    continue
+                channel_id = config.get("giftcode_channel_id") or config.get("general_channel_id")
+                channel = guild.get_channel(int(channel_id)) if channel_id else None
+                verified_role = guild.get_role(config["verified_role_id"]) if config.get("verified_role_id") else None
+                # First poll for this guild: seed silently so we don't dump the backlog.
+                seed = await database.announced_count(guild_id) == 0
+                for c in codes:
+                    code = c.get("code")
+                    if not code:
+                        continue
+                    created = c.get("createdAt")
+                    created = str(created) if created is not None else None  # column is TEXT
+                    is_new = await database.mark_code_announced(guild_id, code, created)
+                    if is_new and not seed and channel:
+                        await self._announce_new_code(channel, verified_role, code)
+            except Exception as exc:  # noqa: BLE001 - one bad guild must not kill the loop
+                logging.warning("Gift-code check failed for guild %s: %s", guild_id, exc)
 
     @check_codes.before_loop
     async def _before(self):
